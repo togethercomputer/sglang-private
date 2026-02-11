@@ -515,6 +515,11 @@ class Scheduler(
             self.draft_worker = None
             return
 
+        if self.spec_algorithm.is_async_spec():
+            # Async spec: draft runs on a dedicated GPU in a separate process
+            self._init_async_spec_worker()
+            return
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -536,6 +541,62 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+    def _init_async_spec_worker(self):
+        """Initialize the async spec worker with a dedicated draft GPU process."""
+        from sglang.srt.speculative.async_spec.async_draft_runner import (
+            run_async_draft_runner_process,
+        )
+        from sglang.srt.speculative.async_spec.async_spec_worker import (
+            AsyncSpecWorker,
+        )
+
+        import torch.multiprocessing as mp
+
+        draft_gpu_id = self.server_args.tp_size
+
+        logger.info(f"Spawning async draft runner on GPU {draft_gpu_id}")
+
+        ctx = mp.get_context("spawn")
+        target_comm, draft_comm = ctx.Pipe(duplex=True)
+        result_pipe_r, result_pipe_w = ctx.Pipe(duplex=False)
+
+        self.draft_process = ctx.Process(
+            target=run_async_draft_runner_process,
+            args=(self.server_args, draft_gpu_id, draft_comm, result_pipe_w),
+            daemon=True,
+        )
+        self.draft_process.start()
+        result_pipe_w.close()
+        draft_comm.close()
+
+        # Wait for draft runner to be ready
+        logger.info("Waiting for async draft runner to initialize...")
+        draft_info = result_pipe_r.recv()
+        result_pipe_r.close()
+
+        if draft_info.get("status") != "ready":
+            error_msg = draft_info.get("error", "Unknown error")
+            raise RuntimeError(
+                f"Async draft runner failed to start: {error_msg}"
+            )
+
+        logger.info(
+            f"Async draft runner ready on GPU {draft_info['draft_gpu_id']}, "
+            f"vocab_size={draft_info['vocab_size']}"
+        )
+
+        # Create AsyncSpecWorker
+        self.draft_worker = AsyncSpecWorker(
+            server_args=self.server_args,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            dp_rank=self.dp_rank,
+            moe_ep_rank=self.moe_ep_rank,
+            nccl_port=self.nccl_port,
+            target_worker=self.tp_worker,
+        )
+        self.draft_worker.comm_pipe = target_comm
 
     def init_model_worker(self):
         self.init_tp_model_worker()
