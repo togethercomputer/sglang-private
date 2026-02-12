@@ -550,25 +550,29 @@ class Scheduler(
         from sglang.srt.speculative.async_spec.async_spec_worker import (
             AsyncSpecWorker,
         )
+        from sglang.srt.speculative.async_spec.nccl_comm import create_nccl_channel
+        from sglang.srt.utils.common import get_open_port
 
         import torch.multiprocessing as mp
 
         draft_gpu_id = self.server_args.tp_size
+        async_spec_nccl_port = get_open_port()
 
-        logger.info(f"Spawning async draft runner on GPU {draft_gpu_id}")
+        logger.info(
+            f"Spawning async draft runner on GPU {draft_gpu_id}, "
+            f"NCCL port {async_spec_nccl_port}"
+        )
 
         ctx = mp.get_context("spawn")
-        target_comm, draft_comm = ctx.Pipe(duplex=True)
         result_pipe_r, result_pipe_w = ctx.Pipe(duplex=False)
 
         self.draft_process = ctx.Process(
             target=run_async_draft_runner_process,
-            args=(self.server_args, draft_gpu_id, draft_comm, result_pipe_w),
+            args=(self.server_args, draft_gpu_id, async_spec_nccl_port, result_pipe_w),
             daemon=True,
         )
         self.draft_process.start()
         result_pipe_w.close()
-        draft_comm.close()
 
         # Wait for draft runner to be ready
         logger.info("Waiting for async draft runner to initialize...")
@@ -586,6 +590,16 @@ class Scheduler(
             f"vocab_size={draft_info['vocab_size']}"
         )
 
+        # Create NCCL channel (rank=0, target side)
+        nccl_channel = create_nccl_channel(
+            rank=0,
+            device=torch.device(f"cuda:{self.gpu_id}"),
+            nccl_port=async_spec_nccl_port,
+            max_batch_size=self.server_args.max_running_requests or 64,
+            max_spec_k=self.server_args.speculative_num_steps,
+            max_prefill_tokens=self.server_args.max_prefill_tokens or 16384,
+        )
+
         # Create AsyncSpecWorker
         self.draft_worker = AsyncSpecWorker(
             server_args=self.server_args,
@@ -596,7 +610,7 @@ class Scheduler(
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
         )
-        self.draft_worker.comm_pipe = target_comm
+        self.draft_worker.nccl_channel = nccl_channel
 
     def init_model_worker(self):
         self.init_tp_model_worker()

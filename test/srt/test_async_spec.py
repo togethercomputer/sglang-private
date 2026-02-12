@@ -1,7 +1,7 @@
 """Tests for asynchronous speculative decoding.
 
 Tests the ASYNC_SPEC algorithm which runs the draft model on a dedicated GPU
-in a separate process, communicating via multiprocessing Pipe.
+in a separate process, communicating via NCCL.
 
 NOTE: These tests require at least 2 GPUs. The target model runs on GPU 0
 and the draft model runs on GPU 1.
@@ -126,36 +126,18 @@ class TestAsyncSpecUnit(CustomTestCase):
         self.assertEqual(len(accepted_suffixes), 0)
         self.assertEqual(len(recovery_tokens), 0)
 
-    def test_handshake_protocol(self):
-        """Test the NCCL handshake helper functions."""
+    def test_command_codes(self):
+        """Test the command code constants."""
         from sglang.srt.speculative.async_spec.handshake import (
             CMD_EXIT,
             CMD_PREFILL,
             CMD_SPEC_REQUEST,
-            concat_int64,
         )
 
         # Test command codes
         self.assertEqual(CMD_SPEC_REQUEST, 0)
         self.assertEqual(CMD_PREFILL, 1)
         self.assertEqual(CMD_EXIT, 2)
-
-        # Test concat_int64
-        t1 = torch.tensor([1, 2, 3], dtype=torch.int64)
-        t2 = torch.tensor([4, 5], dtype=torch.int64)
-        result = concat_int64(t1, t2)
-        self.assertEqual(result.shape, (5,))
-        self.assertTrue(torch.equal(result, torch.tensor([1, 2, 3, 4, 5])))
-
-        # Test concat_int64 with None
-        result = concat_int64(t1, None, t2)
-        self.assertEqual(result.shape, (5,))
-
-        # Test concat_int64 with auto-cast
-        t3 = torch.tensor([6, 7], dtype=torch.int32)
-        result = concat_int64(t1, t3)
-        self.assertEqual(result.dtype, torch.int64)
-        self.assertEqual(result.shape, (5,))
 
     def test_tree_utils(self):
         """Test tree utility functions."""

@@ -1,7 +1,7 @@
 """Dedicated-GPU draft model runner for async speculative decoding.
 
 This process runs on a separate GPU and receives commands from the target
-scheduler via multiprocessing Pipe. It maintains a tree cache of speculative
+scheduler via NCCL. It maintains a tree cache of speculative
 continuations that can be served instantly on cache hits.
 
 Adapted from SSD's DraftRunner.
@@ -16,9 +16,8 @@ import torch
 
 from sglang.srt.speculative.async_spec.handshake import (
     CMD_EXIT,
-    PrefillRequest,
-    SpecRequest,
-    SpecResponse,
+    CMD_PREFILL,
+    CMD_SPEC_REQUEST,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,7 +27,7 @@ class AsyncDraftRunner:
     """Runs on a dedicated GPU, receives spec requests, manages tree cache.
 
     The draft runner operates in a loop:
-    1. Receive command from target scheduler via Pipe
+    1. Receive command from target scheduler via NCCL
     2. For spec requests: cache lookup -> respond -> background tree decode
     3. For prefill: run draft model prefill to warm up KV cache
     """
@@ -38,13 +37,13 @@ class AsyncDraftRunner:
         server_args,
         draft_model_path: str,
         draft_gpu_id: int,
-        comm_pipe,  # multiprocessing.Connection (our end for recv/send)
+        channel,  # AsyncSpecNcclChannel
         vocab_size: int,
     ):
         self.server_args = server_args
         self.draft_model_path = draft_model_path
         self.draft_gpu_id = draft_gpu_id
-        self.comm_pipe = comm_pipe
+        self.channel = channel
         self.device = torch.device(f"cuda:{draft_gpu_id}")
 
         self.spec_k = server_args.speculative_num_steps
@@ -66,23 +65,20 @@ class AsyncDraftRunner:
 
         while True:
             try:
-                msg = self.comm_pipe.recv()
+                cmd = self.channel.recv_command()
 
-                if isinstance(msg, int) and msg == CMD_EXIT:
+                if cmd == CMD_EXIT:
                     logger.info("AsyncDraftRunner received exit command")
                     break
-                elif isinstance(msg, SpecRequest):
-                    self._handle_spec_request(msg)
-                elif isinstance(msg, PrefillRequest):
-                    self._handle_prefill(msg)
+                elif cmd == CMD_SPEC_REQUEST:
+                    self._handle_spec_request()
+                elif cmd == CMD_PREFILL:
+                    self._handle_prefill()
                 else:
                     logger.error(
-                        f"AsyncDraftRunner received unknown message: {type(msg)}"
+                        f"AsyncDraftRunner received unknown command: {cmd}"
                     )
                     break
-            except EOFError:
-                logger.info("AsyncDraftRunner pipe closed, exiting")
-                break
             except Exception as e:
                 logger.error(
                     f"AsyncDraftRunner error in draft loop: {e}", exc_info=True
@@ -91,38 +87,27 @@ class AsyncDraftRunner:
 
         logger.info("AsyncDraftRunner exiting draft loop")
 
-    def _handle_prefill(self, request: PrefillRequest):
-        """Receive prefill tensors from target."""
+    def _handle_prefill(self):
+        """Receive prefill tensors from target via NCCL."""
+        num_reqs, total_tokens, input_ids, req_pool_indices, seq_lens = (
+            self.channel.unpack_prefill()
+        )
         logger.debug(
-            f"Draft prefill: {request.num_reqs} reqs, {request.total_tokens} tokens"
+            f"Draft prefill: {num_reqs} reqs, {total_tokens} tokens"
         )
         # TODO: Run draft model forward to populate KV cache
 
-    def _handle_spec_request(self, request: SpecRequest):
+    def _handle_spec_request(self):
         """Core async spec logic: cache lookup -> respond -> background tree decode."""
-        B = request.batch_size
-        K = request.lookahead
-        V = request.vocab_size
-
-        cache_keys = torch.tensor(
-            request.cache_keys, dtype=torch.int64, device=self.device
-        )
-        temperatures = torch.tensor(  # noqa: F841
-            request.temperatures, dtype=torch.float32, device=self.device
+        B, K, fan_out, vocab_size, cache_keys, temperatures = (
+            self.channel.unpack_spec_request()
         )
 
         # Step 1: Cache lookup and build response
-        speculations, logits_q, cache_hits = self._hit_cache_and_respond(
-            cache_keys, B, K, V
-        )
+        speculations = self._hit_cache_and_respond(cache_keys, B, K, vocab_size)
 
-        # Send response back to target (as CPU tensors for pickling)
-        response = SpecResponse(
-            speculations=speculations.cpu(),
-            logits_q=logits_q.cpu(),
-            cache_hits=cache_hits.cpu(),
-        )
-        self.comm_pipe.send(response)
+        # Send speculations back to target via NCCL
+        self.channel.send_speculations(speculations)
 
         # --- Target proceeds to verify while we continue ---
         # Background tree decode to populate cache for next iteration
@@ -135,7 +120,7 @@ class AsyncDraftRunner:
         B: int,
         K: int,
         V: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Check tree cache, return cached/random tokens (matching SSD)."""
         # Init with random logits so token IDs are in-vocab (matching SSD)
         out_logits = torch.empty(
@@ -167,7 +152,7 @@ class AsyncDraftRunner:
         # Build speculations [B, K+1] = recovery_token + K draft tokens
         speculations = torch.cat([recovery_tokens, out_tokens.to(torch.int64)], dim=1)
 
-        return speculations, out_logits, cache_hits
+        return speculations
 
     def _reset_tree_cache(self):
         """Reset tensor-backed tree cache (matching SSD _reset_tree_cache_tensors)."""
@@ -181,7 +166,7 @@ class AsyncDraftRunner:
 def run_async_draft_runner_process(
     server_args,
     draft_gpu_id: int,
-    comm_pipe,  # multiprocessing.Connection (draft end)
+    nccl_port: int,
     result_pipe,  # multiprocessing.Connection (for init status)
 ):
     """Entry point for the draft runner subprocess."""
@@ -216,16 +201,8 @@ def run_async_draft_runner_process(
         )
         vocab_size = model_config.vocab_size
 
-        # Create the draft runner
-        runner = AsyncDraftRunner(
-            server_args=server_args,
-            draft_model_path=draft_model_path,
-            draft_gpu_id=draft_gpu_id,
-            comm_pipe=comm_pipe,
-            vocab_size=vocab_size,
-        )
-
-        # Signal readiness to parent process
+        # Signal readiness to parent process (before NCCL init so parent can
+        # proceed to create its own NCCL channel concurrently)
         result_pipe.send(
             {
                 "status": "ready",
@@ -234,6 +211,28 @@ def run_async_draft_runner_process(
             }
         )
         result_pipe.close()
+
+        # Create NCCL channel (rank=1, draft side)
+        from sglang.srt.speculative.async_spec.nccl_comm import create_nccl_channel
+
+        device = torch.device(f"cuda:{draft_gpu_id}")
+        channel = create_nccl_channel(
+            rank=1,
+            device=device,
+            nccl_port=nccl_port,
+            max_batch_size=server_args.max_running_requests or 64,
+            max_spec_k=server_args.speculative_num_steps,
+            max_prefill_tokens=server_args.max_prefill_tokens or 16384,
+        )
+
+        # Create the draft runner
+        runner = AsyncDraftRunner(
+            server_args=server_args,
+            draft_model_path=draft_model_path,
+            draft_gpu_id=draft_gpu_id,
+            channel=channel,
+            vocab_size=vocab_size,
+        )
 
         # Enter the main loop
         runner.draft_loop()

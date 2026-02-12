@@ -3,7 +3,7 @@
 This class lives in the scheduler process and orchestrates the
 speculate -> verify -> postprocess cycle. It wraps the target TpModelWorker
 and communicates with a remote AsyncDraftRunner running on a dedicated GPU
-via multiprocessing Pipe.
+via NCCL.
 
 Reuses SGLang's existing EagleVerifyInput/verify infrastructure for the
 verification step — async spec only changes how speculation is derived
@@ -13,23 +13,19 @@ verification step — async spec only changes how speculation is derived
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.speculative.async_spec.handshake import (
-    TargetDraftHandshake,
-    send_exit_command,
-    send_prefill_command,
-)
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.async_spec.nccl_comm import AsyncSpecNcclChannel
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +34,7 @@ class AsyncSpecWorker:
     """Scheduler-side orchestrator for async speculation.
 
     Wraps the target TpModelWorker and communicates with a remote
-    AsyncDraftRunner running on a dedicated GPU via multiprocessing Pipe.
+    AsyncDraftRunner running on a dedicated GPU via NCCL.
 
     The verify step reuses the existing EagleVerifyInput infrastructure
     since async spec uses topk=1 (a chain, not a tree), and the verification
@@ -74,8 +70,8 @@ class AsyncSpecWorker:
         self.num_draft_tokens = server_args.speculative_num_draft_tokens
         self.page_size = server_args.page_size
 
-        # Communication pipe (set by scheduler after spawning draft process)
-        self.comm_pipe = None  # multiprocessing.Connection
+        # NCCL channel (set by scheduler after spawning draft process)
+        self.nccl_channel: Optional[AsyncSpecNcclChannel] = None
 
         # Model info
         self.vocab_size = target_worker.model_runner.model_config.vocab_size
@@ -122,7 +118,7 @@ class AsyncSpecWorker:
                     req.last_spec_step_accepted_len = -1
 
         # Notify draft runner about prefill via NCCL
-        if self.comm_pipe is not None:
+        if self.nccl_channel is not None:
             try:
                 input_ids = model_worker_batch.input_ids
                 req_pool_indices = torch.tensor(
@@ -138,8 +134,8 @@ class AsyncSpecWorker:
                     dtype=torch.int64,
                     device=self.device,
                 )
-                send_prefill_command(
-                    self.comm_pipe, self.device, input_ids, req_pool_indices, seq_lens
+                self.nccl_channel.send_prefill(
+                    input_ids, req_pool_indices, seq_lens
                 )
             except Exception as e:
                 logger.warning(f"Failed to send prefill to draft runner: {e}")
@@ -165,7 +161,7 @@ class AsyncSpecWorker:
             )
 
         # STEP 1: SPECULATE — get draft predictions from draft runner
-        speculations, logits_q, cache_hits = self._speculate(reqs)
+        speculations = self._speculate(reqs)
         # STEP 2: BUILD VERIFY INPUT — construct EagleVerifyInput for the chain
         # For topk=1 (chain), the tree structures are trivial:
         # - draft_token: [recovery, tok0, tok1, ..., tokK-1] flattened across batch
@@ -268,20 +264,37 @@ class AsyncSpecWorker:
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
-    def _speculate(
-        self, reqs: List[Req]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Send spec request to draft, receive speculations."""
-        handshake = TargetDraftHandshake(
-            reqs=reqs,
+    def _speculate(self, reqs: List[Req]) -> torch.Tensor:
+        """Send spec request to draft via NCCL, receive speculations."""
+        B = len(reqs)
+
+        # Build cache_keys [B, 3] and temperatures [B] on GPU
+        cache_keys = torch.zeros(B, 3, dtype=torch.int64, device=self.device)
+        temperatures = torch.zeros(B, dtype=torch.float32, device=self.device)
+        for i, req in enumerate(reqs):
+            req_pool_idx = req.req_pool_idx if req.req_pool_idx is not None else 0
+            accepted_len = req.last_spec_step_accepted_len
+            recovery_token = (
+                req.recovery_token_id if req.recovery_token_id is not None else 0
+            )
+            cache_keys[i, 0] = req_pool_idx
+            cache_keys[i, 1] = accepted_len
+            cache_keys[i, 2] = recovery_token
+            temperatures[i] = req.sampling_params.temperature
+
+        # Send request via NCCL
+        self.nccl_channel.send_spec_request(
+            batch_size=B,
             lookahead=self.spec_k,
-            async_fan_out=self.fan_out,
+            fan_out=self.fan_out,
             vocab_size=self.vocab_size,
-            draft_dtype=self.draft_dtype,
-            device=self.device,
-            comm_pipe=self.comm_pipe,
+            cache_keys=cache_keys,
+            temperatures=temperatures,
         )
-        return handshake.execute_full_handshake()
+
+        # Receive speculations [B, K+1]
+        speculations = self.nccl_channel.recv_speculations(B, self.spec_k)
+        return speculations
 
     def _verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         """Run verification using existing eagle verify infrastructure.
@@ -336,9 +349,9 @@ class AsyncSpecWorker:
 
     def send_exit(self):
         """Send exit command to draft runner."""
-        if self.comm_pipe is not None:
+        if self.nccl_channel is not None:
             try:
-                send_exit_command(self.comm_pipe)
+                self.nccl_channel.send_exit()
             except Exception as e:
                 logger.warning(f"Failed to send exit to draft runner: {e}")
 
