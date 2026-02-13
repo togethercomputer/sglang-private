@@ -95,6 +95,21 @@ def get_forked_recovery_tokens_from_logits(
     return forked_tokens
 
 
+def compute_mq_len(fan_out_list: list) -> int:
+    """Compute the total number of tree query tokens per sequence.
+
+    MQ_LEN = sum of fan_out values across all depths. This is the number
+    of alternative continuation tokens generated at each tree decode step.
+
+    Args:
+        fan_out_list: per-depth fan-out counts (e.g. [2, 2, 1] for K+1 depths)
+
+    Returns:
+        Total number of tree query tokens per sequence.
+    """
+    return sum(fan_out_list)
+
+
 def apply_sampler_x_rescaling(
     probs: torch.Tensor,
     sampler_x: float,

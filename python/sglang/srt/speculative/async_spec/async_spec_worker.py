@@ -282,6 +282,16 @@ class AsyncSpecWorker:
             cache_keys[i, 2] = recovery_token
             temperatures[i] = req.sampling_params.temperature
 
+        # Compute current sequence lengths for the draft runner
+        seq_lens = torch.tensor(
+            [
+                len(req.origin_input_ids) + len(req.output_ids)
+                for req in reqs
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+
         # Send request via NCCL
         self.nccl_channel.send_spec_request(
             batch_size=B,
@@ -290,6 +300,7 @@ class AsyncSpecWorker:
             vocab_size=self.vocab_size,
             cache_keys=cache_keys,
             temperatures=temperatures,
+            seq_lens=seq_lens,
         )
 
         # Receive speculations [B, K+1]

@@ -3111,6 +3111,7 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
     # Create a scheduler and run the event loop
+    scheduler = None
     try:
         scheduler = Scheduler(
             server_args,
@@ -3141,6 +3142,13 @@ def run_scheduler_process(
 
         pipe_writer.send(result_dict)
 
+        # Install SIGTERM handler so the scheduler can clean up the draft
+        # runner before exiting.  Raising SystemExit triggers the finally block.
+        def _sigterm_handler(signum, frame):
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
@@ -3168,7 +3176,19 @@ def run_scheduler_process(
             else:
                 scheduler.event_loop_normal_disagg_decode()
 
+    except SystemExit:
+        pass
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+    finally:
+        # Send exit command to draft runner (if async spec) so it can
+        # clean up GPU/NCCL resources before being killed.
+        if scheduler is not None and hasattr(scheduler, "draft_worker"):
+            dw = scheduler.draft_worker
+            if hasattr(dw, "send_exit"):
+                try:
+                    dw.send_exit()
+                except Exception:
+                    pass

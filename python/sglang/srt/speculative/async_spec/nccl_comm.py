@@ -7,15 +7,16 @@ avoids sending unused data (logits_q, cache_hits).
 Buffer layout for decode request (request_int_buf):
   [cmd | B | K | fan_out | vocab_size | reserved*3 | cache_keys(B*3)...]
 
-Protocol (all commands start with a grouped send/recv of the full
-fixed-size request_int_buf + request_temp_buf so that NCCL element
-counts always match):
+Protocol (all commands start with a grouped send/recv of 3 fixed-size
+tensors: request_int_buf + request_temp_buf + seq_lens_buf so that NCCL
+element counts always match):
 
-  Decode:  target group{send int, send temp} -> draft recvs, processes,
-           draft send response_buf -> target recvs
-  Prefill: target group{send int, send temp} -> draft recvs,
+  Decode:  target group{send int, send temp, send seq_lens} -> draft recvs,
+           processes, draft send response_buf -> target recvs
+  Prefill: target group{send int, send temp, send seq_lens} -> draft recvs,
            target send prefill_buf -> draft recvs
-  Exit:    target group{send int, send temp} -> draft recvs, exits
+  Exit:    target group{send int, send temp, send seq_lens} -> draft recvs,
+           exits
 """
 
 from __future__ import annotations
@@ -62,6 +63,12 @@ class AsyncSpecNcclChannel:
             dtype=torch.float32,
             device=device,
         )
+        # Sequence lengths [max_B] (current total length per request)
+        self.seq_lens_buf = torch.zeros(
+            max_batch_size,
+            dtype=torch.int64,
+            device=device,
+        )
         # Response: speculations [max_B, max_K+1] flattened
         self.response_buf = torch.zeros(
             max_batch_size * (max_spec_k + 1),
@@ -94,6 +101,7 @@ class AsyncSpecNcclChannel:
         vocab_size: int,
         cache_keys: torch.Tensor,  # [B, 3] int64 on device
         temperatures: torch.Tensor,  # [B] float32 on device
+        seq_lens: torch.Tensor,  # [B] int64 on device
     ):
         """Target sends decode request to draft via NCCL."""
         from sglang.srt.speculative.async_spec.handshake import CMD_SPEC_REQUEST
@@ -111,11 +119,14 @@ class AsyncSpecNcclChannel:
         )
         # Pack temperatures
         self.request_temp_buf[:B] = temperatures
+        # Pack seq_lens
+        self.seq_lens_buf[:B] = seq_lens
 
         # Always send full fixed-size buffers so NCCL counts match
         self.comm.group_start()
         self._send(self.request_int_buf)
         self._send(self.request_temp_buf)
+        self._send(self.seq_lens_buf)
         self.comm.group_end()
         self._sync()
 
@@ -151,6 +162,7 @@ class AsyncSpecNcclChannel:
         self.comm.group_start()
         self._send(self.request_int_buf)
         self._send(self.request_temp_buf)
+        self._send(self.seq_lens_buf)
         self.comm.group_end()
         self._sync()
 
@@ -177,6 +189,7 @@ class AsyncSpecNcclChannel:
         self.comm.group_start()
         self._send(self.request_int_buf)
         self._send(self.request_temp_buf)
+        self._send(self.seq_lens_buf)
         self.comm.group_end()
         self._sync()
 
@@ -196,6 +209,7 @@ class AsyncSpecNcclChannel:
         self.comm.group_start()
         self._recv(self.request_int_buf)
         self._recv(self.request_temp_buf)
+        self._recv(self.seq_lens_buf)
         self.comm.group_end()
         self._sync()
 
@@ -213,10 +227,10 @@ class AsyncSpecNcclChannel:
 
     def unpack_spec_request(
         self,
-    ) -> Tuple[int, int, int, int, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Draft unpacks a spec request from pre-filled buffers.
 
-        Returns: (batch_size, lookahead, fan_out, vocab_size, cache_keys, temperatures)
+        Returns: (batch_size, lookahead, fan_out, vocab_size, cache_keys, temperatures, seq_lens)
         """
         B = self.request_int_buf[1].item()
         K = self.request_int_buf[2].item()
@@ -227,8 +241,9 @@ class AsyncSpecNcclChannel:
             B, 3
         )
         temperatures = self.request_temp_buf[:B]
+        seq_lens = self.seq_lens_buf[:B]
 
-        return B, K, fan_out, vocab_size, cache_keys, temperatures
+        return B, K, fan_out, vocab_size, cache_keys, temperatures, seq_lens
 
     def unpack_prefill(
         self,

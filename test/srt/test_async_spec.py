@@ -7,6 +7,7 @@ NOTE: These tests require at least 2 GPUs. The target model runs on GPU 0
 and the draft model runs on GPU 1.
 """
 
+import gc
 import unittest
 
 import torch
@@ -30,7 +31,7 @@ class TestAsyncSpecUnit(CustomTestCase):
 
     def test_verify_greedy_all_accept(self):
         """Test verification with greedy decoding where all tokens match."""
-        from sglang.srt.speculative.async_spec.verify import verify
+        from test.srt.async_spec_test_utils import verify
 
         B, K, V = 2, 3, 100
         # Create logits where argmax matches speculations
@@ -63,7 +64,7 @@ class TestAsyncSpecUnit(CustomTestCase):
 
     def test_verify_greedy_reject_at_position(self):
         """Test verification with greedy decoding where token 2 mismatches."""
-        from sglang.srt.speculative.async_spec.verify import verify
+        from test.srt.async_spec_test_utils import verify
 
         B, K, V = 1, 3, 100
         logits_p = torch.zeros(B, K + 1, V)
@@ -106,7 +107,7 @@ class TestAsyncSpecUnit(CustomTestCase):
 
     def test_verify_empty_batch(self):
         """Test verification with empty inputs."""
-        from sglang.srt.speculative.async_spec.verify import verify
+        from test.srt.async_spec_test_utils import verify
 
         B, K, V = 0, 3, 100
         logits_p = torch.zeros(B, K + 1, V)
@@ -161,15 +162,18 @@ class TestAsyncSpecUnit(CustomTestCase):
 
 
 @unittest.skipIf(_get_num_gpus() < 2, "Requires at least 2 GPUs")
-class TestAsyncSpecDraftRunner(CustomTestCase):
-    """Test the draft runner via Engine (NCCL requires full dist init)."""
+class TestAsyncSpecE2E(CustomTestCase):
+    """End-to-end tests for async speculative decoding using the Engine API.
 
-    def test_draft_runner_via_engine(self):
-        """Test draft runner starts and communicates correctly through Engine."""
+    A single engine is shared across all tests to avoid GPU memory leaks
+    from repeated engine create/destroy cycles.
+    """
+
+    @classmethod
+    def setUpClass(cls):
         import sglang as sgl
 
-        # Starting the engine implicitly starts the draft runner process
-        engine = sgl.Engine(
+        cls.engine = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             speculative_algorithm="ASYNC_SPEC",
             speculative_draft_model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -179,94 +183,51 @@ class TestAsyncSpecDraftRunner(CustomTestCase):
             log_level="info",
         )
 
-        try:
-            # If engine starts without error, draft runner is working
-            prompt = "Hello"
-            output = engine.generate(prompt, {"temperature": 0, "max_new_tokens": 5})
-            self.assertGreater(len(output["text"]), 0)
-        finally:
-            engine.shutdown()
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "engine") and cls.engine is not None:
+            cls.engine.shutdown()
+            cls.engine = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
-
-@unittest.skipIf(_get_num_gpus() < 2, "Requires at least 2 GPUs")
-class TestAsyncSpecE2E(CustomTestCase):
-    """End-to-end test for async speculative decoding using the Engine API."""
+    def test_draft_runner_starts(self):
+        """Test draft runner starts and communicates correctly through Engine."""
+        prompt = "Hello"
+        output = self.engine.generate(prompt, {"temperature": 0, "max_new_tokens": 5})
+        self.assertGreater(len(output["text"]), 0)
 
     def test_basic_generation(self):
         """Test that async spec can generate text."""
-        import sglang as sgl
-
-        engine = sgl.Engine(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            speculative_algorithm="ASYNC_SPEC",
-            speculative_draft_model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            speculative_num_steps=3,
-            speculative_async_fan_out=2,
-            mem_fraction_static=0.5,
-            log_level="info",
-        )
-
-        try:
-            prompt = "The capital of France is"
-            output = engine.generate(prompt, {"temperature": 0, "max_new_tokens": 20})
-            text = output["text"]
-            print(f"Generated: {text}")
-            self.assertGreater(len(text), 0)
-        finally:
-            engine.shutdown()
+        prompt = "The capital of France is"
+        output = self.engine.generate(prompt, {"temperature": 0, "max_new_tokens": 20})
+        text = output["text"]
+        print(f"Generated: {text}")
+        self.assertGreater(len(text), 0)
 
     def test_batch_generation(self):
         """Test batch generation with async spec."""
-        import sglang as sgl
+        prompts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+        ]
+        params = {"temperature": 0, "max_new_tokens": 30}
 
-        engine = sgl.Engine(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            speculative_algorithm="ASYNC_SPEC",
-            speculative_draft_model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            speculative_num_steps=3,
-            speculative_async_fan_out=2,
-            mem_fraction_static=0.5,
-            log_level="info",
-        )
-
-        try:
-            prompts = [
-                "Hello, my name is",
-                "The president of the United States is",
-                "The capital of France is",
-            ]
-            params = {"temperature": 0, "max_new_tokens": 30}
-
-            outputs = engine.generate(prompts, params)
-            for prompt, output in zip(prompts, outputs):
-                text = output["text"]
-                print(f"Prompt: {prompt}")
-                print(f"Generated: {text}")
-                self.assertGreater(len(text), 0)
-        finally:
-            engine.shutdown()
+        outputs = self.engine.generate(prompts, params)
+        for prompt, output in zip(prompts, outputs):
+            text = output["text"]
+            print(f"Prompt: {prompt}")
+            print(f"Generated: {text}")
+            self.assertGreater(len(text), 0)
 
     def test_max_tokens_respected(self):
         """Test that max_tokens is respected."""
-        import sglang as sgl
-
-        engine = sgl.Engine(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            speculative_algorithm="ASYNC_SPEC",
-            speculative_draft_model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            speculative_num_steps=3,
-            mem_fraction_static=0.5,
-            log_level="info",
-        )
-
-        try:
-            prompt = "Write a long essay about AI"
-            output = engine.generate(prompt, {"temperature": 0, "max_new_tokens": 5})
-            completion_tokens = output["meta_info"]["completion_tokens"]
-            print(f"Completion tokens: {completion_tokens}")
-            self.assertLessEqual(completion_tokens, 5)
-        finally:
-            engine.shutdown()
+        prompt = "Write a long essay about AI"
+        output = self.engine.generate(prompt, {"temperature": 0, "max_new_tokens": 5})
+        completion_tokens = output["meta_info"]["completion_tokens"]
+        print(f"Completion tokens: {completion_tokens}")
+        self.assertLessEqual(completion_tokens, 5)
 
 
 if __name__ == "__main__":
