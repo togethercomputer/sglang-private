@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    ASYNC_SPEC = auto()
     NONE = auto()
 
     @classmethod
@@ -45,6 +46,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_async_spec(self) -> bool:
+        return self == SpeculativeAlgorithm.ASYNC_SPEC
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
@@ -101,6 +105,14 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_async_spec():
+            # AsyncSpecWorker is instantiated differently (wraps target worker),
+            # so we return the class for the scheduler to instantiate.
+            from sglang.srt.speculative.async_spec.async_spec_worker import (
+                AsyncSpecWorker,
+            )
+
+            return AsyncSpecWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 
