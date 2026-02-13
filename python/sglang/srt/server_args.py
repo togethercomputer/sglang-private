@@ -474,6 +474,14 @@ class ServerArgs:
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
 
+    # Speculative decoding (async spec)
+    speculative_async_fan_out: int = 3
+    speculative_async_fan_out_list: Optional[List[int]] = None
+    speculative_async_fan_out_list_miss: Optional[List[int]] = None
+    speculative_async_jit_speculate: bool = True
+    speculative_async_sampler_x: Optional[float] = None
+    speculative_async_draft_temperature: Optional[float] = None
+
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
@@ -2434,6 +2442,43 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm == "ASYNC_SPEC":
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "ASYNC_SPEC requires --speculative-draft-model-path to be set."
+                )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for async speculative decoding. "
+                    "You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            logger.warning(
+                "Overlap scheduler and mixed chunked prefill are disabled for async speculative decoding."
+            )
+
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 5
+
+            # Set eagle_topk to 1 for async spec (no tree branching on target side)
+            self.speculative_eagle_topk = 1
+            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
+            # Compute fan_out_list defaults from fan_out and num_steps
+            # K+1 entries: one per glue decode position (recovery + K draft).
+            if self.speculative_async_fan_out_list is None:
+                self.speculative_async_fan_out_list = [
+                    self.speculative_async_fan_out
+                ] * (self.speculative_num_steps + 1)
+            if self.speculative_async_fan_out_list_miss is None:
+                self.speculative_async_fan_out_list_miss = (
+                    self.speculative_async_fan_out_list
+                )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -3845,7 +3890,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "ASYNC_SPEC"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3992,6 +4037,44 @@ class ServerArgs:
             "--enable-multi-layer-eagle",
             action="store_true",
             help="Enable multi-layer Eagle speculative decoding.",
+        )
+
+        # Async speculative decoding
+        parser.add_argument(
+            "--speculative-async-fan-out",
+            type=int,
+            default=ServerArgs.speculative_async_fan_out,
+            help="Fan-out F for tree branches in async speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-async-fan-out-list",
+            type=json_list_type,
+            default=ServerArgs.speculative_async_fan_out_list,
+            help="Per-depth fan-out list for cache hits in async speculative decoding (JSON list of ints).",
+        )
+        parser.add_argument(
+            "--speculative-async-fan-out-list-miss",
+            type=json_list_type,
+            default=ServerArgs.speculative_async_fan_out_list_miss,
+            help="Per-depth fan-out list for cache misses in async speculative decoding (JSON list of ints).",
+        )
+        parser.add_argument(
+            "--speculative-async-jit-speculate",
+            type=lambda x: x.lower() in ("true", "1", "yes"),
+            default=ServerArgs.speculative_async_jit_speculate,
+            help="Generate tokens on cache miss vs random in async speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-async-sampler-x",
+            type=float,
+            default=ServerArgs.speculative_async_sampler_x,
+            help="Draft distribution rescaling factor for async speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-async-draft-temperature",
+            type=float,
+            default=ServerArgs.speculative_async_draft_temperature,
+            help="Override draft model temperature for async speculative decoding.",
         )
 
         # Expert parallelism

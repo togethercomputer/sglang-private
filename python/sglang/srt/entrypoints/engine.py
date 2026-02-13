@@ -445,7 +445,28 @@ class Engine(EngineBase):
         return ret
 
     def shutdown(self):
-        """Shutdown the engine"""
+        """Shutdown the engine.
+
+        Sends SIGTERM first to allow subprocesses (especially the async draft
+        runner) to clean up GPU/NCCL resources, then falls back to SIGKILL.
+        """
+        import time
+
+        import psutil
+
+        try:
+            parent = psutil.Process(os.getpid())
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.terminate()  # SIGTERM — catchable
+                except psutil.NoSuchProcess:
+                    pass
+            # Give subprocesses up to 3s to clean up
+            _, alive = psutil.wait_procs(children, timeout=3)
+        except Exception:
+            pass
+
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
