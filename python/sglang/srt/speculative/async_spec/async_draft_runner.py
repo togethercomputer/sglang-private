@@ -102,9 +102,23 @@ class AsyncDraftRunner:
         # Pre-allocate constant tensors used every draft step
         self._init_prealloc_buffers()
 
-        # CUDA graph runner for tree decode (Phase 2)
+        # CUDA graph runners
         self.tree_cuda_graph_runner = None
+        self.glue_decode_cuda_graph_runner = None
         if not getattr(server_args, "disable_cuda_graph", False):
+            max_bs = getattr(server_args, "max_running_requests", None) or 64
+
+            # Initialize attention backend CUDA graph state once with the max
+            # of both tree decode (max_bs * mq_len) and glue decode (max_bs)
+            max_tree_N = max_bs * self.mq_len
+            max_glue_tokens = max_bs * (self.spec_k + 1)
+            cuda_graph_max_bs = max(max_tree_N, max_bs)
+            cuda_graph_max_tokens = max(max_tree_N, max_glue_tokens)
+            self.attn_backend.init_cuda_graph_state(
+                cuda_graph_max_bs, cuda_graph_max_tokens
+            )
+
+            # Tree decode CUDA graph runner
             try:
                 from sglang.srt.speculative.async_spec.tree_cuda_graph_runner import (
                     TreeDecodeCudaGraphRunner,
@@ -112,7 +126,7 @@ class AsyncDraftRunner:
 
                 self.tree_cuda_graph_runner = TreeDecodeCudaGraphRunner(
                     model_runner=self.model_runner,
-                    max_batch_size=getattr(server_args, "max_running_requests", None) or 64,
+                    max_batch_size=max_bs,
                     mq_len=self.mq_len,
                     device=self.device,
                 )
@@ -123,6 +137,26 @@ class AsyncDraftRunner:
             except Exception as e:
                 logger.warning(f"Tree CUDA graph runner init failed: {e}, using eager mode")
                 self.tree_cuda_graph_runner = None
+
+            # Glue decode CUDA graph runner (multi-query decode, matches SSD)
+            try:
+                from sglang.srt.speculative.async_spec.glue_decode_cuda_graph_runner import (
+                    GlueDecodeCudaGraphRunner,
+                )
+
+                self.glue_decode_cuda_graph_runner = GlueDecodeCudaGraphRunner(
+                    model_runner=self.model_runner,
+                    spec_k=self.spec_k,
+                    max_batch_size=max_bs,
+                    device=self.device,
+                )
+                self.glue_decode_cuda_graph_runner.capture()
+                if not self.glue_decode_cuda_graph_runner.graphs:
+                    logger.warning("Glue decode CUDA graph capture failed, using eager mode")
+                    self.glue_decode_cuda_graph_runner = None
+            except Exception as e:
+                logger.warning(f"Glue decode CUDA graph runner init failed: {e}, using eager mode")
+                self.glue_decode_cuda_graph_runner = None
 
         # Profiling
         self._draft_step_times = []
@@ -241,26 +275,32 @@ class AsyncDraftRunner:
 
         # Construct ForwardBatch
         from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
             ForwardBatch,
             ForwardMode,
         )
 
+        seq_lens_i32 = seq_lens.to(torch.int32)
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=num_reqs,
             input_ids=input_ids.to(torch.int32),
             req_pool_indices=req_pool_indices.to(torch.int32),
-            seq_lens=seq_lens.to(torch.int32),
+            seq_lens=seq_lens_i32,
+            seq_lens_cpu=seq_lens_i32.cpu(),
             out_cache_loc=out_cache_loc.to(torch.int32),
             seq_lens_sum=total_tokens,
             positions=positions.to(torch.int64),
             extend_num_tokens=total_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens.tolist(),
+            extend_seq_lens_cpu=extend_seq_lens.tolist(),
             extend_start_loc=extend_start_loc,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
             attn_backend=self.attn_backend,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
         # Run the draft model forward to populate KV cache
@@ -423,6 +463,7 @@ class AsyncDraftRunner:
     ):
         """Run K decode steps to generate draft tokens (matching SSD jit_speculate)."""
         from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
             ForwardBatch,
             ForwardMode,
         )
@@ -439,18 +480,21 @@ class AsyncDraftRunner:
         slot_map = self._compute_slot_map(positions, draft_block_tables)
         self._update_kv_mapping(req_pool_indices, positions, slot_map)
 
+        seq_lens_i32 = (positions + 1).to(torch.int32)
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
             batch_size=B,
             input_ids=input_ids.to(torch.int32),
             req_pool_indices=req_pool_indices_i32,
-            seq_lens=(positions + 1).to(torch.int32),
+            seq_lens=seq_lens_i32,
+            seq_lens_cpu=seq_lens_i32.cpu(),
             out_cache_loc=slot_map.to(torch.int32),
             seq_lens_sum=B,
             positions=positions.to(torch.int64),
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
             attn_backend=self.attn_backend,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
         # Forward pass — call forward_decode directly
@@ -472,8 +516,10 @@ class AsyncDraftRunner:
             self._update_kv_mapping(req_pool_indices, positions, slot_map)
 
             # Update ForwardBatch in-place
+            seq_lens_i32 = (positions + 1).to(torch.int32)
             forward_batch.input_ids = input_ids.to(torch.int32)
-            forward_batch.seq_lens = (positions + 1).to(torch.int32)
+            forward_batch.seq_lens = seq_lens_i32
+            forward_batch.seq_lens_cpu = seq_lens_i32.cpu()
             forward_batch.out_cache_loc = slot_map.to(torch.int32)
             forward_batch.positions = positions.to(torch.int64)
 
@@ -537,38 +583,72 @@ class AsyncDraftRunner:
         req_pool_indices_glue = seq_ids.unsqueeze(-1).expand(-1, K + 1).reshape(-1)
         self._update_kv_mapping(req_pool_indices_glue, positions_flat, slot_map_flat)
 
-        # Build EXTEND ForwardBatch
+        # Build common tensors for glue decode
         seq_lens = (num_tokens + K).to(torch.int32)  # [B] total after extension
-        extend_seq_lens = torch.full((B,), K + 1, dtype=torch.int32, device=self.device)
         extend_prefix_lens = (num_tokens - 1).to(torch.int32)  # [B]
-        extend_start_loc = torch.zeros(B, dtype=torch.int32, device=self.device)
-        if B > 1:
-            extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+        seq_ids_i32 = seq_ids.to(torch.int32)
+        input_ids_i32 = glue_decode_input_ids.to(torch.int32)
+        seq_lens_sum = int(seq_lens.sum().item())
 
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=B,
-            input_ids=glue_decode_input_ids.to(torch.int32),
-            req_pool_indices=seq_ids.to(torch.int32),
-            seq_lens=seq_lens,
-            out_cache_loc=slot_map_flat,
-            seq_lens_sum=int(seq_lens.sum().item()),
-            positions=positions_flat,
-            extend_num_tokens=B * (K + 1),
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_start_loc=extend_start_loc,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool=self.token_to_kv_pool,
-            attn_backend=self.attn_backend,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+        # ── CUDA graph path for glue decode (matches SSD's approach) ──
+        use_glue_graph = (
+            self.glue_decode_cuda_graph_runner is not None
+            and self.glue_decode_cuda_graph_runner.can_run(B)
         )
 
-        # Run glue decode forward
-        output = self.model_runner.forward(forward_batch)
+        if use_glue_graph:
+            seq_lens_cpu = seq_lens.cpu()
+            output = self.glue_decode_cuda_graph_runner.replay(
+                B=B,
+                input_ids=input_ids_i32,
+                positions=positions_flat,
+                out_cache_loc=slot_map_flat,
+                req_pool_indices=seq_ids_i32,
+                seq_lens=seq_lens,
+                seq_lens_sum=seq_lens_sum,
+                seq_lens_cpu=seq_lens_cpu,
+                extend_prefix_lens=extend_prefix_lens,
+            )
+            # Extract hidden_states from CUDA graph output
+            hidden_states = output.hidden_states  # [bucket_B*(K+1), H]
+            if hidden_states is not None:
+                hidden_states = hidden_states[: B * (K + 1)]
+            else:
+                # Fallback: output might store logits differently
+                hidden_states = output.next_token_logits  # unlikely but safe
+        else:
+            # ── Eager fallback ──
+            extend_seq_lens = torch.full((B,), K + 1, dtype=torch.int32, device=self.device)
+            extend_start_loc = torch.zeros(B, dtype=torch.int32, device=self.device)
+            if B > 1:
+                extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
 
-        # Extract all-position logits from hidden_states
-        hidden_states = output.logits_output.hidden_states  # [B*(K+1), H]
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=B,
+                input_ids=input_ids_i32,
+                req_pool_indices=seq_ids_i32,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens.cpu(),
+                out_cache_loc=slot_map_flat,
+                seq_lens_sum=seq_lens_sum,
+                positions=positions_flat,
+                extend_num_tokens=B * (K + 1),
+                extend_seq_lens=extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=extend_prefix_lens.tolist(),
+                extend_seq_lens_cpu=extend_seq_lens.tolist(),
+                extend_start_loc=extend_start_loc,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                attn_backend=self.attn_backend,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+
+            output = self.model_runner.forward(forward_batch)
+            hidden_states = output.logits_output.hidden_states  # [B*(K+1), H]
+
+        # Compute all-position logits from hidden_states via lm_head
         lm_head_weight = self.model_runner.model.lm_head.weight  # [V, H]
         glue_decode_logits_flat = F.linear(
             hidden_states.to(lm_head_weight.dtype), lm_head_weight
@@ -693,6 +773,7 @@ class AsyncDraftRunner:
             spec_logits: [N, K, V] logits per branch per step
         """
         from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
             ForwardBatch,
             ForwardMode,
         )
@@ -816,6 +897,7 @@ class AsyncDraftRunner:
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool=self.token_to_kv_pool,
                 attn_backend=self.attn_backend,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
             for depth in range(K):

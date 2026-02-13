@@ -21,7 +21,11 @@ from typing import Dict, List
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +91,8 @@ class TreeDecodeCudaGraphRunner:
         # Precomputed per-step plan data (set by precompute_plans)
         self._plans_ready = False
 
-        # Initialize attention backend for CUDA graph state
-        self.attn_backend.init_cuda_graph_state(max_N, max_N)
+        # NOTE: init_cuda_graph_state must be called by the caller before
+        # constructing this runner to avoid reinitializing shared state.
 
         # Capture infrastructure
         self.stream = torch.cuda.Stream(device=device)
@@ -167,6 +171,7 @@ class TreeDecodeCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.attn_backend,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
         # Initialize attention metadata for capture (allocates persistent

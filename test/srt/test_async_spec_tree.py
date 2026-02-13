@@ -912,6 +912,33 @@ class TestTreeCudaGraphRunnerBuckets(unittest.TestCase):
         self.assertEqual(buckets, [])
 
 
+class TestGlueDecodeCudaGraphRunnerBuckets(unittest.TestCase):
+    """Test GlueDecodeCudaGraphRunner bucket size computation."""
+
+    def test_bucket_sizes(self):
+        from sglang.srt.speculative.async_spec.glue_decode_cuda_graph_runner import (
+            GlueDecodeCudaGraphRunner,
+        )
+
+        buckets = GlueDecodeCudaGraphRunner._compute_bucket_sizes(8)
+        self.assertIn(1, buckets)
+        self.assertIn(2, buckets)
+        self.assertIn(4, buckets)
+        self.assertIn(8, buckets)
+        self.assertEqual(buckets, sorted(buckets))
+
+    def test_bucket_sizes_non_power_of_2(self):
+        from sglang.srt.speculative.async_spec.glue_decode_cuda_graph_runner import (
+            GlueDecodeCudaGraphRunner,
+        )
+
+        buckets = GlueDecodeCudaGraphRunner._compute_bucket_sizes(5)
+        self.assertIn(1, buckets)
+        self.assertIn(2, buckets)
+        self.assertIn(4, buckets)
+        self.assertIn(5, buckets)  # Max always included
+
+
 class TestBenchmarkVectorizedKVMapping(unittest.TestCase):
     """Benchmark vectorized vs per-element KV mapping."""
 

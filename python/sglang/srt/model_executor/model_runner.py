@@ -807,6 +807,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
 
+        if self.is_draft_worker:
+            # Draft worker runs on its own GPU in a separate process.
+            # Initialize a minimal single-rank distributed environment so
+            # get_world_group() et al. work.
+            init_distributed_environment(
+                backend=backend,
+                world_size=1,
+                rank=0,
+                local_rank=self.gpu_id,
+                distributed_init_method=f"tcp://127.0.0.1:{self.dist_port}",
+                timeout=self.server_args.dist_timeout,
+            )
+            initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+            )
+            initialize_dp_attention(
+                server_args=self.server_args,
+                model_config=self.model_config,
+            )
+
         min_per_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -2069,6 +2090,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Capture device graphs."""
         self.graph_runner = None
         self.graph_mem_usage = 0
+
+        if self.is_draft_worker:
+            # Draft workers use specialized CUDA graph runners
+            # (TreeDecodeCudaGraphRunner, GlueDecodeCudaGraphRunner)
+            # that are initialized in AsyncDraftRunner, not here.
+            return
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models

@@ -181,19 +181,24 @@ class AsyncSpecWorker:
     def _send_prefill_to_draft(self, batch: ScheduleBatch, model_worker_batch):
         """Allocate draft blocks and send prefill data to draft runner."""
         max_blocks = self.nccl_channel.max_blocks
-        input_ids = model_worker_batch.input_ids
         num_reqs = len(batch.reqs)
 
         req_pool_indices_list = []
         seq_lens_list = []
         positions_parts = []
         block_tables_list = []
+        input_ids_parts = []
 
         for req in batch.reqs:
             rpi = req.req_pool_idx
-            seq_len = len(req.origin_input_ids) + len(req.output_ids)
+            # Build full input_ids for this request (draft has no prefix cache)
+            full_ids = req.origin_input_ids + req.output_ids
+            seq_len = len(full_ids)
             req_pool_indices_list.append(rpi)
             seq_lens_list.append(seq_len)
+            input_ids_parts.append(
+                torch.tensor(full_ids, device=self.device, dtype=torch.int64)
+            )
 
             # Build positions for this request
             positions_parts.append(
@@ -213,6 +218,7 @@ class AsyncSpecWorker:
             else:
                 block_tables_list.append([0] * max_blocks)
 
+        input_ids = torch.cat(input_ids_parts)
         req_pool_indices = torch.tensor(
             req_pool_indices_list, dtype=torch.int64, device=self.device
         )
