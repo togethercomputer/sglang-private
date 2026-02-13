@@ -106,6 +106,7 @@ class AsyncSpecWorker:
         self.topk = 1  # Async spec uses chain (topk=1), not tree
         self.num_draft_tokens = server_args.speculative_num_draft_tokens
         self.page_size = server_args.page_size
+        self.mq_len = sum(server_args.speculative_async_fan_out_list)  # Tree width
 
         # NCCL channel (set by scheduler after spawning draft process)
         self.nccl_channel: Optional[AsyncSpecNcclChannel] = None
@@ -387,10 +388,12 @@ class AsyncSpecWorker:
                 nt = self.draft_num_tokens[rpi]
                 num_tokens[i] = nt
 
-                # Ensure enough blocks for current tokens + K speculation steps
+                # Ensure enough blocks for current tokens + tree decode
+                # Tree decode needs: K+1 (glue) + K*MQ_LEN (tree steps) extra positions
                 if self.draft_block_allocator is not None and rpi in self.draft_block_tables:
                     current_blocks = self.draft_block_tables[rpi]
-                    needed_blocks = (nt + K + self.page_size - 1) // self.page_size
+                    tree_lookahead = K + 1 + K * self.mq_len
+                    needed_blocks = (nt + tree_lookahead + self.page_size - 1) // self.page_size
                     additional = needed_blocks - len(current_blocks)
                     if additional > 0 and self.draft_block_allocator.can_allocate(additional):
                         new_blocks = self.draft_block_allocator.allocate(additional)

@@ -2472,11 +2472,19 @@ class ServerArgs:
             if self.speculative_async_fan_out_list is None:
                 self.speculative_async_fan_out_list = [
                     self.speculative_async_fan_out
-                ] * self.speculative_num_steps
+                ] * (self.speculative_num_steps + 1)  # K+1 entries for K+1 glue decode positions
             if self.speculative_async_fan_out_list_miss is None:
                 self.speculative_async_fan_out_list_miss = (
                     self.speculative_async_fan_out_list
                 )
+            # Validate that hit and miss fan_out_lists have the same total
+            # (required for the flat tensor reshape in get_forked_recovery_tokens)
+            assert sum(self.speculative_async_fan_out_list) == sum(
+                self.speculative_async_fan_out_list_miss
+            ), (
+                f"sum(fan_out_list)={sum(self.speculative_async_fan_out_list)} "
+                f"!= sum(fan_out_list_miss)={sum(self.speculative_async_fan_out_list_miss)}"
+            )
 
     def _handle_load_format(self):
         if (

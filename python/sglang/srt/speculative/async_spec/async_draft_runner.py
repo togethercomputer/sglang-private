@@ -15,14 +15,20 @@ Adapted from SSD's DraftRunner.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.speculative.async_spec.handshake import (
     CMD_EXIT,
     CMD_PREFILL,
     CMD_SPEC_REQUEST,
+)
+from sglang.srt.speculative.async_spec.tree_utils import (
+    get_forked_recovery_tokens_from_logits,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +62,11 @@ class AsyncDraftRunner:
         self.fan_out = server_args.speculative_async_fan_out
         self.jit_speculate = server_args.speculative_async_jit_speculate
 
+        # Fan-out lists: [K+1] entries for K+1 glue decode positions
+        self.fan_out_list = server_args.speculative_async_fan_out_list
+        self.fan_out_list_miss = server_args.speculative_async_fan_out_list_miss
+        self.mq_len = sum(self.fan_out_list)  # Total tree width per request
+
         # Model runner and memory pools
         self.model_runner = model_runner
         self.page_size = server_args.page_size
@@ -73,6 +84,41 @@ class AsyncDraftRunner:
 
         self.vocab_size = vocab_size
 
+        # Pre-allocate constant tensors used every draft step
+        self._init_prealloc_buffers()
+
+        # Profiling
+        self._draft_step_times = []
+
+    def _init_prealloc_buffers(self):
+        """Pre-allocate constant tensors to avoid repeated CUDA mallocs."""
+        K = self.spec_k
+        MQ_LEN = self.mq_len
+        d = self.device
+
+        # Step position offsets: at step i, KV write positions shift by i * MQ_LEN
+        self._step_pos_offsets = (
+            torch.arange(K, device=d, dtype=torch.int64)[:, None] * MQ_LEN
+        )
+        # Step rope offsets: at step i, rope positions shift by i
+        self._step_rope_offsets = torch.arange(K, device=d, dtype=torch.int64)[
+            :, None
+        ]
+
+        # Fan-out depth index tensors:
+        # _fan_idx_hit[m] = depth of branch m for cache hits
+        # e.g. for fan_out_list=[2,2,2], K=2: [0,0,1,1,2,2]
+        fan_out_t = torch.as_tensor(self.fan_out_list, device=d, dtype=torch.int64)
+        fan_out_t_miss = torch.as_tensor(
+            self.fan_out_list_miss, device=d, dtype=torch.int64
+        )
+        self._fan_idx_hit = torch.arange(K + 1, device=d, dtype=torch.int64).repeat_interleave(fan_out_t)
+        self._fan_idx_miss = torch.arange(K + 1, device=d, dtype=torch.int64).repeat_interleave(fan_out_t_miss)
+
+        # Arange for MQ_LEN positions and K+1 glue positions
+        self._arange_mq = torch.arange(MQ_LEN, device=d, dtype=torch.int64)
+        self._arange_kp1 = torch.arange(K + 1, device=d, dtype=torch.int64)
+
     def draft_loop(self):
         """Main event loop."""
         logger.info(f"AsyncDraftRunner starting draft loop on GPU {self.draft_gpu_id}")
@@ -83,6 +129,13 @@ class AsyncDraftRunner:
 
                 if cmd == CMD_EXIT:
                     logger.info("AsyncDraftRunner received exit command")
+                    if self._draft_step_times:
+                        avg_ms = (
+                            sum(self._draft_step_times)
+                            * 1000
+                            / len(self._draft_step_times)
+                        )
+                        logger.info(f"Avg draft step time: {avg_ms:.2f}ms")
                     break
                 elif cmd == CMD_SPEC_REQUEST:
                     self._handle_spec_request()
@@ -171,6 +224,12 @@ class AsyncDraftRunner:
             draft_block_tables,
         ) = self.channel.unpack_spec_request()
 
+        _ds0 = time.perf_counter()
+        _prof = os.environ.get("SGLANG_ASYNC_SPEC_PROFILE", "0") == "1"
+        if _prof:
+            torch.cuda.synchronize()
+            _d0 = time.perf_counter()
+
         # Step 1: Cache lookup and build response
         out_tokens, out_logits, glue_decode_input_ids, cache_hits = (
             self._hit_cache_and_respond(
@@ -187,8 +246,12 @@ class AsyncDraftRunner:
         # Send speculations back to target via NCCL
         self.channel.send_speculations(speculations)
 
+        if _prof:
+            torch.cuda.synchronize()
+            _d1 = time.perf_counter()
+
         # --- Target proceeds to verify while we continue ---
-        # Build partial_tree_decode_args (matching SSD structure, for future tree decode)
+        # Build partial_tree_decode_args (matching SSD structure)
         partial_tree_decode_args = {
             "num_tokens": num_tokens,
             "seq_ids": cache_keys[:, 0],
@@ -201,10 +264,37 @@ class AsyncDraftRunner:
         # Reset tree cache for fresh population
         self._reset_tree_cache()
 
-        # TODO: Tree decode (glue decode + tree decode steps)
-        # tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)
-        # tokens, logits, activations = self._decode_tree(tree_decode_args)
-        # self._populate_tree_cache(tree_decode_args, tokens, logits, cache_hits)
+        # Tree decode: glue decode + tree decode steps + cache populate
+        tree_decode_args = self._build_tree_batch(
+            partial_tree_decode_args, glue_decode_input_ids
+        )
+
+        if _prof:
+            torch.cuda.synchronize()
+            _d2 = time.perf_counter()
+
+        tokens, logits = self._decode_tree(tree_decode_args)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _d3 = time.perf_counter()
+
+        self._populate_tree_cache(
+            tree_decode_args, tokens, logits, tree_decode_args["cache_hits"]
+        )
+
+        self._draft_step_times.append(time.perf_counter() - _ds0)
+
+        if _prof:
+            torch.cuda.synchronize()
+            _d4 = time.perf_counter()
+            logger.info(
+                f"[PROFILE draft] service={(_d1-_d0)*1000:.2f}ms "
+                f"build_tree={(_d2-_d1)*1000:.2f}ms "
+                f"decode_tree={(_d3-_d2)*1000:.2f}ms "
+                f"populate={(_d4-_d3)*1000:.2f}ms "
+                f"total={(_d4-_d0)*1000:.2f}ms"
+            )
 
     def _hit_cache_and_respond(
         self,
@@ -250,7 +340,6 @@ class AsyncDraftRunner:
                     temperatures, draft_block_tables,
                 )
         else:
-            # TODO: throw error here when we properly build a cache.
             # Cache is empty — always run draft model (no cache to serve from)
             self.jit_speculate_decode(
                 cache_keys, num_tokens, out_logits, out_tokens,
@@ -318,6 +407,328 @@ class AsyncDraftRunner:
             # Update for next iteration
             input_ids = next_tokens
             positions = positions + 1
+
+    # ── Tree decode methods (adapted from SSD) ──
+
+    def _build_tree_batch(self, partial_tree_decode_args, glue_decode_input_ids):
+        """Run glue decode and fork tokens to construct tree decode arguments.
+
+        Adapted from SSD's _build_tree_batch. Flow:
+        1. Run EXTEND forward for glue decode (K+1 tokens per request)
+        2. Fork alternative tokens from glue decode logits
+        3. Construct tree_decode_args dictionary
+        """
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+        )
+
+        K = self.spec_k
+        B = glue_decode_input_ids.shape[0] // (K + 1)
+        num_tokens = partial_tree_decode_args["num_tokens"]
+        dbt = partial_tree_decode_args["dbt"]
+        cache_hits = partial_tree_decode_args["cache_hits"]
+        temperatures = partial_tree_decode_args["temperatures"]
+        seq_ids = partial_tree_decode_args["seq_ids"]  # req_pool_indices [B]
+
+        assert B == num_tokens.shape[0], (
+            f"_build_tree_batch: B={B} != num_tokens.shape[0]={num_tokens.shape[0]}"
+        )
+
+        # ── 1. Prepare and run glue decode (EXTEND forward) ──
+
+        # Positions for glue decode: [num_tokens-1, num_tokens, ..., num_tokens+K-1] per request
+        positions_start = (num_tokens - 1).unsqueeze(-1)  # [B, 1]
+        positions_grid = positions_start + self._arange_kp1  # [B, K+1]
+        positions_flat = positions_grid.reshape(-1).to(torch.int64)  # [B*(K+1)]
+
+        # Compute slot map for glue decode from block tables
+        b_expanded = torch.arange(B, device=self.device).unsqueeze(-1).expand(-1, K + 1)
+        block_indices = (positions_grid // self.page_size).to(torch.int64)
+        offsets = (positions_grid % self.page_size).to(torch.int32)
+        blk_ids = dbt[b_expanded, block_indices]
+        slot_map_grid = blk_ids * self.page_size + offsets
+        slot_map_flat = slot_map_grid.reshape(-1).to(torch.int32)
+
+        # Update req_to_token_pool for glue decode positions
+        req_pool_indices_glue = seq_ids.unsqueeze(-1).expand(-1, K + 1).reshape(-1)
+        self._update_kv_mapping(req_pool_indices_glue, positions_flat, slot_map_flat)
+
+        # Build EXTEND ForwardBatch
+        seq_lens = (num_tokens + K).to(torch.int32)  # [B] total after extension
+        extend_seq_lens = torch.full((B,), K + 1, dtype=torch.int32, device=self.device)
+        extend_prefix_lens = (num_tokens - 1).to(torch.int32)  # [B]
+        extend_start_loc = torch.zeros(B, dtype=torch.int32, device=self.device)
+        if B > 1:
+            extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=B,
+            input_ids=glue_decode_input_ids.to(torch.int32),
+            req_pool_indices=seq_ids.to(torch.int32),
+            seq_lens=seq_lens,
+            out_cache_loc=slot_map_flat,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            positions=positions_flat,
+            extend_num_tokens=B * (K + 1),
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            attn_backend=self.attn_backend,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+
+        # Run glue decode forward
+        output = self.model_runner.forward(forward_batch)
+
+        # Extract all-position logits from hidden_states
+        hidden_states = output.logits_output.hidden_states  # [B*(K+1), H]
+        lm_head_weight = self.model_runner.model.lm_head.weight  # [V, H]
+        glue_decode_logits_flat = F.linear(
+            hidden_states.to(lm_head_weight.dtype), lm_head_weight
+        )  # [B*(K+1), V]
+        glue_decode_logits = glue_decode_logits_flat.view(B, K + 1, -1)  # [B, K+1, V]
+
+        # ── 2. Fork alternative tokens from glue decode logits ──
+
+        forked_rec_tokens = get_forked_recovery_tokens_from_logits(
+            glue_decode_logits,
+            self.fan_out_list,
+            cache_hits,
+            glue_decode_input_ids.reshape(B, K + 1),
+            self.fan_out_list_miss,
+        ).view(-1)  # [B*MQ_LEN] = [N]
+
+        # ── 3. Construct tree_decode_args ──
+
+        N = B * self.mq_len
+        assert forked_rec_tokens.shape[0] == N, (
+            f"forked_rec_tokens.shape[0]={forked_rec_tokens.shape[0]} != N={N}"
+        )
+
+        # b_flat: maps each of the N branches to its parent request index (0..B-1)
+        b_flat = (
+            torch.arange(B, device=self.device, dtype=torch.int64)[:, None]
+            .expand(B, self.mq_len)
+            .flatten()
+        )  # [N]
+
+        # fkp1_flat: branch index within each request (0..MQ_LEN-1)
+        fkp1_flat = self._arange_mq.repeat(B)  # [N]
+
+        # j_idx_flat: tree depth for each branch (accounts for fan_out per depth)
+        j_idx_flat = torch.cat(
+            [self._fan_idx_hit if cache_hits[b] else self._fan_idx_miss for b in range(B)]
+        )  # [N]
+
+        # KV write positions: after glue decode, starting at num_tokens + K
+        initial_positions = (num_tokens[b_flat] - 1) + (K + 1) + fkp1_flat  # [N]
+        # = num_tokens[b] + K + branch_offset
+
+        # Rope positions: based on tree depth
+        initial_rope_positions = (num_tokens[b_flat] - 1) + j_idx_flat + 1  # [N]
+        # = num_tokens[b] + depth
+
+        seq_ids_expanded = seq_ids[b_flat]  # [N]
+        temperatures_expanded = temperatures[b_flat]  # [N]
+
+        metadata = torch.tensor([B, K, self.fan_out, N], dtype=torch.int64, device=self.device)
+
+        tree_decode_args = {
+            "metadata": metadata,
+            "input_ids": forked_rec_tokens,  # [N]
+            "positions": initial_positions,  # [N] KV write positions
+            "rope_positions": initial_rope_positions,  # [N] for positional encoding
+            "block_tables": dbt,  # [B, max_blocks]
+            "temps": temperatures_expanded,  # [N]
+            "rec_flat": forked_rec_tokens,  # [N]
+            "seq_ids_expanded": seq_ids_expanded,  # [N] req_pool_indices per branch
+            "b_flat": b_flat,  # [N] parent request index per branch
+            "cache_hits": cache_hits,  # [B]
+        }
+
+        return tree_decode_args
+
+    @torch.inference_mode()
+    def _compute_step_positions_and_slot_maps(
+        self,
+        initial_positions: torch.Tensor,
+        initial_rope_positions: torch.Tensor,
+        dbt: torch.Tensor,
+        B: int,
+        K: int,
+        N: int,
+    ):
+        """Precompute positions, rope positions, context lens, and slot maps for all K tree steps.
+
+        Returns:
+            step_positions: [K, N] KV write positions per step
+            step_rope_positions: [K, N] rope positions per step
+            step_context_lens: [K, B] context lens per step per request
+            step_slot_maps: [K, N] KV cache slot indices per step
+        """
+        MQ_LEN = self.mq_len
+
+        # Position arrays for all K steps via broadcasting
+        step_positions = initial_positions[None, :] + self._step_pos_offsets  # [K, N]
+        step_rope_positions = initial_rope_positions[None, :] + self._step_rope_offsets  # [K, N]
+
+        # Context lens: last branch position per request per step + 1
+        step_context_lens = step_positions.view(K, B, MQ_LEN)[:, :, -1] + 1  # [K, B]
+
+        # Slot maps for all steps from block tables
+        b_flat = (
+            torch.arange(B, device=self.device, dtype=torch.int64)[:, None]
+            .expand(B, MQ_LEN)
+            .flatten()
+        )  # [N]
+        batch_indices = torch.arange(N, device=self.device)
+        dbt_expanded = dbt[b_flat]  # [N, max_blocks]
+
+        step_offsets = (step_positions % self.page_size).to(torch.int32)  # [K, N]
+        step_blk_idx = (step_positions // self.page_size).to(torch.int64)  # [K, N]
+        step_blk_ids = dbt_expanded[batch_indices[None, :], step_blk_idx]  # [K, N]
+        step_slot_maps = step_blk_ids * self.page_size + step_offsets  # [K, N]
+
+        return step_positions, step_rope_positions, step_context_lens, step_slot_maps
+
+    def _decode_tree(self, tree_decode_args):
+        """Run K autoregressive decode steps for all N tree branches.
+
+        Adapted from SSD's _decode_tree. Each step:
+        1. Update KV mapping for current step's positions
+        2. Build DECODE ForwardBatch with N entries
+        3. Forward pass, sample tokens
+        4. Store logits and tokens
+
+        Returns:
+            spec_tokens: [N, K] sampled tokens per branch per step
+            spec_logits: [N, K, V] logits per branch per step
+        """
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
+
+        metadata = tree_decode_args["metadata"]
+        B, K, fan_out, N = (
+            metadata[0].item(),
+            metadata[1].item(),
+            metadata[2].item(),
+            metadata[3].item(),
+        )
+
+        V = self.vocab_size
+        spec_tokens = torch.zeros((N, K), dtype=torch.int64, device=self.device)
+        spec_logits = torch.zeros((N, K, V), dtype=torch.float32, device=self.device)
+
+        initial_positions = tree_decode_args["positions"]  # [N]
+        initial_rope_positions = tree_decode_args["rope_positions"]  # [N]
+        current_input_ids = tree_decode_args["input_ids"]  # [N]
+        dbt = tree_decode_args["block_tables"]  # [B, max_blocks]
+        temps = tree_decode_args["temps"]  # [N]
+        seq_ids_expanded = tree_decode_args["seq_ids_expanded"]  # [N]
+        b_flat = tree_decode_args["b_flat"]  # [N]
+
+        # Precompute all step positions, rope positions, context lens, slot maps
+        step_positions, step_rope_positions, step_context_lens, step_slot_maps = (
+            self._compute_step_positions_and_slot_maps(
+                initial_positions, initial_rope_positions, dbt, B, K, N
+            )
+        )
+
+        _prof = os.environ.get("SGLANG_ASYNC_SPEC_PROFILE", "0") == "1"
+
+        for depth in range(K):
+            if _prof:
+                torch.cuda.synchronize()
+                _st = time.perf_counter()
+
+            # Get precomputed values for this step
+            step_kv_positions = step_positions[depth]  # [N]
+            step_slot_map = step_slot_maps[depth].to(torch.int32)  # [N]
+            step_rope_pos = step_rope_positions[depth]  # [N]
+            # Context lens: expand [B] to [N] using b_flat
+            step_ctx_lens = step_context_lens[depth][b_flat].to(torch.int32)  # [N]
+
+            # Update req_to_token_pool with this step's KV positions
+            self._update_kv_mapping(seq_ids_expanded, step_kv_positions, step_slot_map)
+
+            # Build DECODE ForwardBatch with N entries
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.DECODE,
+                batch_size=N,
+                input_ids=current_input_ids.to(torch.int32),
+                req_pool_indices=seq_ids_expanded.to(torch.int32),
+                seq_lens=step_ctx_lens,
+                out_cache_loc=step_slot_map,
+                seq_lens_sum=int(step_ctx_lens.sum().item()),
+                positions=step_rope_pos.to(torch.int64),
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                attn_backend=self.attn_backend,
+            )
+
+            # Forward pass
+            output = self.model_runner.forward(forward_batch)
+            logits = output.logits_output.next_token_logits  # [N, V]
+
+            spec_logits[:, depth, :] = logits
+            next_tokens = self._sample(logits, temps)
+            spec_tokens[:, depth] = next_tokens
+
+            # Update input for next step
+            current_input_ids = next_tokens
+
+            if _prof:
+                torch.cuda.synchronize()
+                _et = time.perf_counter()
+                logger.info(
+                    f"[PROFILE draft] tree_step[{depth}]={(_et-_st)*1000:.2f}ms"
+                )
+
+        return spec_tokens, spec_logits
+
+    def _populate_tree_cache(
+        self,
+        tree_decode_args: dict,
+        tokens: torch.Tensor,
+        logits: torch.Tensor,
+        cache_hits: torch.Tensor,
+    ):
+        """Store tree decode results in the tree cache for future cache hits.
+
+        Adapted from SSD's _populate_tree_cache.
+
+        Keys are (seq_id, depth_index, recovery_token) tuples.
+        Values are the K speculated tokens and K logits from that starting point.
+        """
+        seq_ids_expanded = tree_decode_args["seq_ids_expanded"].to(torch.int64)  # [N]
+        rec_flat = tree_decode_args["rec_flat"].to(torch.int64)  # [N]
+
+        # j_idx: tree depth per branch, same construction as in _build_tree_batch
+        j_idx_flat = torch.cat(
+            [self._fan_idx_hit if cache_hits[b] else self._fan_idx_miss
+             for b in range(cache_hits.shape[0])]
+        )  # [N]
+
+        # Keys: (seq_id, depth, recovery_token) per branch
+        keys = torch.stack([seq_ids_expanded, j_idx_flat, rec_flat], dim=1).contiguous()  # [N, 3]
+
+        self.tree_cache_keys = keys
+        self.tree_cache_tokens = tokens  # [N, K]
+        self.tree_cache_logits = logits  # [N, K, V]
+
+        logger.debug(
+            f"Tree cache populated: {keys.shape[0]} entries, "
+            f"tokens={tokens.shape}, logits={logits.shape}"
+        )
+
+    # ── Sampling ──
 
     def _sample(self, logits: torch.Tensor, temperatures: torch.Tensor) -> torch.Tensor:
         """Simple temperature-scaled sampling."""

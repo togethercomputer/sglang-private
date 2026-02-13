@@ -144,13 +144,14 @@ class TestAsyncSpecUnit(CustomTestCase):
             make_glue_decode_input_ids,
         )
 
-        # Test make_glue_decode_input_ids
+        # Test make_glue_decode_input_ids (returns flat [B*(K+1)])
         draft_tokens = torch.tensor([[1, 2, 3], [4, 5, 6]])
         rec_tokens = torch.tensor([10, 20])
         result = make_glue_decode_input_ids(draft_tokens, rec_tokens)
-        self.assertEqual(result.shape, (2, 4))
-        self.assertEqual(result[0, 0].item(), 10)
-        self.assertEqual(result[1, 0].item(), 20)
+        self.assertEqual(result.shape, (8,))  # 2 * (3+1) = 8
+        result_2d = result.view(2, 4)
+        self.assertEqual(result_2d[0, 0].item(), 10)
+        self.assertEqual(result_2d[1, 0].item(), 20)
 
         # Test apply_sampler_x_rescaling (identity)
         probs = torch.softmax(torch.randn(2, 100), dim=-1)
