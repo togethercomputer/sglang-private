@@ -14,6 +14,7 @@ import torch
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
+    verify,
 )
 
 
@@ -30,7 +31,6 @@ class TestAsyncSpecUnit(CustomTestCase):
 
     def test_verify_greedy_all_accept(self):
         """Test verification with greedy decoding where all tokens match."""
-        from sglang.srt.speculative.async_spec.verify import verify
 
         B, K, V = 2, 3, 100
         # Create logits where argmax matches speculations
@@ -63,7 +63,6 @@ class TestAsyncSpecUnit(CustomTestCase):
 
     def test_verify_greedy_reject_at_position(self):
         """Test verification with greedy decoding where token 2 mismatches."""
-        from sglang.srt.speculative.async_spec.verify import verify
 
         B, K, V = 1, 3, 100
         logits_p = torch.zeros(B, K + 1, V)
@@ -106,7 +105,6 @@ class TestAsyncSpecUnit(CustomTestCase):
 
     def test_verify_empty_batch(self):
         """Test verification with empty inputs."""
-        from sglang.srt.speculative.async_spec.verify import verify
 
         B, K, V = 0, 3, 100
         logits_p = torch.zeros(B, K + 1, V)

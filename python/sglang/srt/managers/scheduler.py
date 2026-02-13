@@ -585,9 +585,12 @@ class Scheduler(
                 f"Async draft runner failed to start: {error_msg}"
             )
 
+        num_draft_kv_pages = draft_info.get("num_kv_pages", 0)
+        max_blocks = draft_info.get("max_blocks", 128)
         logger.info(
             f"Async draft runner ready on GPU {draft_info['draft_gpu_id']}, "
-            f"vocab_size={draft_info['vocab_size']}"
+            f"vocab_size={draft_info['vocab_size']}, "
+            f"num_kv_pages={num_draft_kv_pages}, max_blocks={max_blocks}"
         )
 
         # Create NCCL channel (rank=0, target side)
@@ -598,6 +601,7 @@ class Scheduler(
             max_batch_size=self.server_args.max_running_requests or 64,
             max_spec_k=self.server_args.speculative_num_steps,
             max_prefill_tokens=self.server_args.max_prefill_tokens or 16384,
+            max_blocks=max_blocks,
         )
 
         # Create AsyncSpecWorker
@@ -609,6 +613,7 @@ class Scheduler(
             moe_ep_rank=self.moe_ep_rank,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
+            num_draft_kv_pages=num_draft_kv_pages,
         )
         self.draft_worker.nccl_channel = nccl_channel
 
