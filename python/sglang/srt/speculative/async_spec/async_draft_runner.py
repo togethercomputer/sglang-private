@@ -72,6 +72,10 @@ class AsyncDraftRunner:
         self.fan_out = server_args.speculative_async_fan_out
         self.fan_out_list = server_args.speculative_async_fan_out_list
         self.fan_out_list_miss = server_args.speculative_async_fan_out_list_miss
+        logger.info(
+            f"AsyncDraftRunner config: spec_k={self.spec_k}, fan_out={self.fan_out}, "
+            f"fan_out_list={self.fan_out_list}, fan_out_list_miss={self.fan_out_list_miss}"
+        )
         self.jit_speculate = server_args.speculative_async_jit_speculate
         self.draft_temperature = server_args.speculative_async_draft_temperature
 
@@ -170,9 +174,8 @@ class AsyncDraftRunner:
         draft_server_args.tp_size = 1
         draft_server_args.dp_size = 1
         draft_server_args.pp_size = 1
-        # Enable CUDA graphs for decode forward passes (JIT + tree decode).
-        # This matches SSD's approach of capturing decode graphs for the draft model.
-        draft_server_args.disable_cuda_graph = False
+        # Disable CUDA graphs for draft model until KV cache interaction is fixed.
+        draft_server_args.disable_cuda_graph = True
         draft_server_args.speculative_algorithm = None
         # Use a reasonable memory fraction for the draft model
         draft_server_args.mem_fraction_static = 0.80
@@ -348,11 +351,18 @@ class AsyncDraftRunner:
         )
 
     @torch.inference_mode()
-    def _run_forward(self, fb) -> torch.Tensor:
-        """Run model forward and return next_token_logits [num_tokens, V].
+    def _run_forward(self, fb, all_logits: bool = False) -> torch.Tensor:
+        """Run model forward and return logits.
 
-        Uses CUDA graph replay for decode mode when available,
-        falling back to eager forward otherwise.
+        Args:
+            fb: ForwardBatch
+            all_logits: If True, compute logits for ALL tokens (not just
+                the last per sequence). Used for glue decode where we need
+                logits at every position to fork tree branches.
+
+        Returns:
+            next_token_logits [num_tokens, V] when all_logits=False,
+            all_token_logits [total_tokens, V] when all_logits=True.
         """
         graph_runner = self.model_runner.graph_runner
         if (
@@ -362,19 +372,41 @@ class AsyncDraftRunner:
         ):
             # CUDA graph path: replay captured decode graph
             logits_output = graph_runner.replay(fb)
+            return logits_output.next_token_logits
         elif fb.forward_mode.is_decode():
             # Eager decode fallback
             self.model_runner.attn_backend.init_forward_metadata(fb)
             logits_output = self.model_runner.forward_decode(
                 fb, skip_attn_backend_init=True
             )
+            return logits_output.next_token_logits
         else:
-            # Extend path (glue decode) — always eager
+            # Extend path (glue decode)
             self.model_runner.attn_backend.init_forward_metadata(fb)
-            logits_output, _ = self.model_runner.forward_extend(
-                fb, skip_attn_backend_init=True
-            )
-        return logits_output.next_token_logits
+            if not all_logits:
+                logits_output, _ = self.model_runner.forward_extend(
+                    fb, skip_attn_backend_init=True
+                )
+                return logits_output.next_token_logits
+            else:
+                # Compute logits for ALL tokens: run the backbone (which
+                # computes hidden states for all tokens) then apply lm_head
+                # weight as a linear projection. This bypasses LogitsProcessor's
+                # last-token pruning while keeping the same attention computation.
+                model = self.model_runner.model
+                hidden_states = model.model(
+                    fb.input_ids, fb.positions, fb
+                )
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
+                # lm_head weight: [vocab_size, hidden_size]; compute logits via matmul
+                weight = model.lm_head.weight
+                torch.cuda.synchronize()  # catch async errors before matmul
+                logits = torch.matmul(
+                    hidden_states.to(weight.dtype), weight.T
+                )
+                torch.cuda.synchronize()  # catch matmul errors
+                return logits.float()
 
     def _sample_tokens(
         self, logits: torch.Tensor, temperatures: torch.Tensor
@@ -555,12 +587,24 @@ class AsyncDraftRunner:
         if num_reqs == 0:
             return
 
+        # Recompute per-req lengths from actual total_tokens to avoid
+        # mismatches with target's seq_lens metadata.
+        if num_reqs == 1:
+            corrected_seq_lens = torch.tensor([total_tokens], dtype=torch.int64, device=self.device)
+        else:
+            corrected_seq_lens = seq_lens.clone()
+            # Clamp so the sum matches total_tokens
+            sl_sum = corrected_seq_lens.sum().item()
+            if sl_sum != total_tokens:
+                logger.warning(f"Prefill: seq_lens sum {sl_sum} != total_tokens {total_tokens}, adjusting")
+                corrected_seq_lens[-1] += total_tokens - sl_sum
+
         # Allocate draft req pool slots (CPU-side — only during prefill)
         draft_req_indices = []
         per_req_lens = []
         for i in range(num_reqs):
             target_idx = target_req_pool_indices[i].item()
-            sl = seq_lens[i].item()
+            sl = corrected_seq_lens[i].item()
 
             # Free old slot if this target req was already tracked
             old_draft_idx = self.target_to_draft[target_idx].item()
@@ -648,6 +692,11 @@ class AsyncDraftRunner:
         draft_indices = self._resolve_draft_indices(target_req_indices)
 
         # Roll back draft KV cache to match verified target state.
+        logger.info(
+            f"Spec request: B={B}, K={K}, "
+            f"target_seq_lens={seq_lens.tolist()}, "
+            f"draft_seq_lens={self.draft_seq_lens[draft_indices].tolist()}"
+        )
         self._rollback_kv_cache(draft_indices, seq_lens)
 
         # Step 1: Cache lookup + optional JIT speculate -> respond to target
@@ -659,11 +708,12 @@ class AsyncDraftRunner:
         self.channel.send_speculations(speculations)
 
         # --- Target proceeds to verify while we continue ---
-        # Step 2: Reset tree cache and run background tree decode
+        # Step 2: Background tree decode (populates tree cache for next hit)
         self._reset_tree_cache()
-        self._build_and_decode_tree(
-            cache_keys, B, K, out_tokens, temperatures, draft_indices, cache_hits
-        )
+        # TODO: re-enable tree decode once KV management is fixed
+        # self._build_and_decode_tree(
+        #     cache_keys, B, K, out_tokens, temperatures, draft_indices, cache_hits
+        # )
 
         self._draft_step_times.append(time.perf_counter() - t0)
 
@@ -741,6 +791,25 @@ class AsyncDraftRunner:
         input_ids = cache_keys[:, 2].to(torch.int32)  # recovery tokens
         draft_cur_lens = self.draft_seq_lens[draft_indices].clone()  # [B]
 
+        # Debug: validate KV slot state before JIT
+        pool = self.req_to_token_pool.req_to_token
+        max_kv_tokens = self.model_runner.max_total_num_tokens
+        for i in range(B):
+            di = draft_indices[i].item()
+            cl = draft_cur_lens[i].item()
+            for p in range(cl):
+                loc = pool[di, p].item()
+                if loc < 0 or loc >= max_kv_tokens:
+                    logger.error(
+                        f"JIT PRE-CHECK: invalid KV loc at pool[{di}, {p}] = {loc} "
+                        f"(max={max_kv_tokens}, draft_seq_len={cl})"
+                    )
+            logger.info(
+                f"JIT: batch {i}, draft_idx={di}, seq_len={cl}, "
+                f"input_id={input_ids[i].item()}, "
+                f"first_loc={pool[di, 0].item()}, last_loc={pool[di, max(0,cl-1)].item()}"
+            )
+
         for step in range(K):
             # Allocate 1 KV slot per request
             new_locs = self.token_to_kv_pool_allocator.alloc(B)
@@ -796,8 +865,9 @@ class AsyncDraftRunner:
         recovery_tokens = cache_keys[:, 2]
         draft_cur_lens = self.draft_seq_lens[draft_indices]  # [B]
 
-        # ── Phase 1: Glue decode ──
-        # Build glue input: [recovery_token, tok_0, ..., tok_{K-1}] per seq
+        # ── Phase 1: Glue decode (single EXTEND forward pass) ──
+        # Process [recovery_token, tok_0, ..., tok_{K-1}] per seq in parallel.
+        # Uses all_logits=True to get logits at EVERY position (not just last).
         glue_flat = make_glue_decode_input_ids(
             returned_tokens.to(torch.int64), recovery_tokens
         ).to(torch.int32)  # [B*(K+1)]
@@ -819,7 +889,7 @@ class AsyncDraftRunner:
             (B,), K + 1, dtype=torch.int64, device=self.device
         )
 
-        # Run glue decode forward (EXTEND)
+        # Run glue decode forward (EXTEND with all_logits=True)
         fb = self._make_extend_forward_batch(
             input_ids=glue_flat,
             req_pool_indices=draft_indices,
@@ -829,7 +899,7 @@ class AsyncDraftRunner:
             extend_seq_lens=glue_extend_seq_lens,
         )
 
-        glue_logits_flat = self._run_forward(fb)  # [B*(K+1), V]
+        glue_logits_flat = self._run_forward(fb, all_logits=True)  # [B*(K+1), V]
         glue_logits = glue_logits_flat.view(B, K + 1, -1)  # [B, K+1, V]
 
         # Fork: sample fan_out alternative tokens at each K+1 position.
@@ -843,8 +913,10 @@ class AsyncDraftRunner:
             returned_tokens=glue_2d,
         )  # [B, MQ_LEN]
 
-        # Update draft seq lens after glue (vectorized)
-        self.draft_seq_lens[draft_indices] = glue_seq_lens
+        # Set draft_seq_lens to cover all written positions (glue + tree)
+        # so that _rollback_kv_cache can free them at the next spec request.
+        # Tree decode writes to positions up to glue_seq_lens + K*MQ_LEN - 1.
+        self.draft_seq_lens[draft_indices] = glue_seq_lens + K * self.mq_len
 
         # ── Phase 2: Tree decode (K steps) with precomputed positions ──
         MQ_LEN = self.mq_len
@@ -938,6 +1010,8 @@ class AsyncDraftRunner:
             spec_logits,
             cache_keys,
         )
+
+        # Ephemeral KV slots freed by _rollback_kv_cache at next spec request.
 
     def _populate_tree_cache(
         self,

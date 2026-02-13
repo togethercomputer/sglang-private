@@ -25,14 +25,17 @@ def make_glue_decode_input_ids(
     - The recovery token (position 0)
     - K speculated tokens (positions 1..K)
 
+    This allows the draft model to process the full speculated sequence
+    and then branch into alternative continuations.
+
     Args:
         draft_tokens: [B, K] speculated draft tokens
         rec_tokens: [B] recovery tokens from target verification
 
     Returns:
-        glue_input_ids: [B*(K+1)] flat concatenation matching SSD convention
+        glue_input_ids: [B, K+1] concatenation of rec_tokens and draft_tokens
     """
-    return torch.cat([rec_tokens.unsqueeze(1), draft_tokens], dim=1).view(-1)
+    return torch.cat([rec_tokens.unsqueeze(1), draft_tokens], dim=1)
 
 
 def get_forked_recovery_tokens_from_logits(
@@ -41,7 +44,6 @@ def get_forked_recovery_tokens_from_logits(
     temperatures: torch.Tensor,
     cache_hits: torch.Tensor,
     fan_out_list_miss: Optional[list] = None,
-    returned_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Extract forked alternative tokens from glue decode logits.
 
@@ -49,71 +51,48 @@ def get_forked_recovery_tokens_from_logits(
     position to form the tree branches. Cache hits use fan_out_list,
     cache misses use fan_out_list_miss.
 
-    Matches SSD's vectorized implementation:
-    - Masks returned_tokens with -inf to avoid re-selecting chain tokens
-    - Uses topk over all K+1 positions simultaneously
-    - Returns flat [B, MQ_LEN] output
-
     Args:
         logits: [B, K+1, V] logits from glue decode
-        fan_out_list: per-depth fan-out for cache hits (K+1 entries)
+        fan_out_list: per-depth fan-out for cache hits
         temperatures: [B] sampling temperatures
         cache_hits: [B] whether each req hit the cache
-        fan_out_list_miss: per-depth fan-out for cache misses (K+1 entries)
-        returned_tokens: [B, K+1] tokens already in the chain to exclude
+        fan_out_list_miss: per-depth fan-out for cache misses
 
     Returns:
-        forked_tokens: [B, MQ_LEN] flat alternative tokens per position
+        forked_tokens: [B, K, max_fan_out] alternative tokens per position
     """
     if fan_out_list_miss is None:
         fan_out_list_miss = fan_out_list
 
     B, K_plus_1, V = logits.shape
+    K = K_plus_1 - 1
+    max_fan_out = max(max(fan_out_list), max(fan_out_list_miss))
     device = logits.device
 
-    assert len(fan_out_list) == K_plus_1, (
-        f"fan_out_list must have K+1={K_plus_1} entries, got {len(fan_out_list)}"
-    )
-    assert len(fan_out_list_miss) == K_plus_1, (
-        f"fan_out_list_miss must have K+1={K_plus_1} entries, got {len(fan_out_list_miss)}"
-    )
+    forked_tokens = torch.zeros(B, K, max_fan_out, dtype=torch.long, device=device)
 
-    # Mask returned tokens with -inf to avoid re-selecting chain tokens.
-    # Don't touch the last position (K), only scatter on positions 0..K-1.
-    # At position d, mask out returned_tokens[:, d+1] (the next-chain token).
-    logits = logits.clone()
-    if returned_tokens is not None:
-        assert returned_tokens.shape == (B, K_plus_1), (
-            f"returned_tokens must be (B, K+1), got {returned_tokens.shape}"
-        )
-        logits[:, :-1, :] = logits[:, :-1, :].scatter(
-            dim=2,
-            index=returned_tokens[:, 1:].unsqueeze(2),
-            value=float("-inf"),
-        )
+    for b in range(B):
+        is_hit = cache_hits[b].item() > 0 if cache_hits is not None else True
+        fo_list = fan_out_list if is_hit else fan_out_list_miss
+        temp = temperatures[b].item()
 
-    # Compute top-k once at max fanout, then mask per row/position
-    k_max = max(max(fan_out_list), max(fan_out_list_miss))
-    _, topk_idx = torch.topk(logits, k_max, dim=-1)  # [B, K+1, k_max]
+        for k in range(K):
+            fo = fo_list[k] if k < len(fo_list) else 1
+            pos_logits = logits[b, k + 1]  # Skip recovery position
 
-    # Build per-b, per-(K+1) counts depending on cache_hits
-    hit_counts = torch.as_tensor(fan_out_list, device=device, dtype=torch.int64)
-    miss_counts = torch.as_tensor(fan_out_list_miss, device=device, dtype=torch.int64)
-    ch_bool = cache_hits.to(torch.bool).view(B, 1)
-    counts_b = torch.where(
-        ch_bool,
-        hit_counts.view(1, -1).expand(B, -1),
-        miss_counts.view(1, -1).expand(B, -1),
-    )  # [B, K+1]
+            if temp <= 0:
+                # Greedy: take top-fo tokens
+                topk_vals, topk_ids = torch.topk(pos_logits, min(fo, V))
+                forked_tokens[b, k, :fo] = topk_ids[:fo]
+            else:
+                # Stochastic: sample fo tokens
+                probs = F.softmax(pos_logits / temp, dim=-1)
+                sampled = torch.multinomial(
+                    probs, num_samples=min(fo, V), replacement=False
+                )
+                forked_tokens[b, k, :fo] = sampled[:fo]
 
-    # Build mask: [B, K+1, k_max]
-    ar = torch.arange(k_max, device=device)
-    mask = ar.view(1, 1, -1) < counts_b.view(B, K_plus_1, 1)
-
-    # Select tokens using mask -> [B, MQ_LEN]
-    idxs_flat = topk_idx.masked_select(mask).view(B, -1)
-
-    return idxs_flat
+    return forked_tokens
 
 
 def compute_mq_len(fan_out_list: list) -> int:
@@ -138,32 +117,20 @@ def apply_sampler_x_rescaling(
 ) -> torch.Tensor:
     """Apply rescaling to draft distribution probabilities.
 
-    Matches SSD: multiplies top-(F+1) probabilities by sampler_x, then
-    renormalizes. This makes the top tokens more or less likely relative
-    to the rest.
+    Rescales the probability distribution to make it sharper or flatter,
+    which affects the diversity of tree branches.
 
     Args:
-        probs: [..., V] probability distribution (any leading dims)
-        sampler_x: rescaling factor for top-(fan_out+1) probabilities
-        fan_out: number of branches used to determine top-k size
+        probs: [B, V] probability distribution
+        sampler_x: rescaling exponent (>1 sharper, <1 flatter)
+        fan_out: number of branches (unused, kept for API compat)
 
     Returns:
-        rescaled_probs: [..., V] rescaled probabilities
+        rescaled_probs: [B, V] rescaled probabilities
     """
     if sampler_x is None or sampler_x == 1.0:
         return probs
 
-    # Find top-(F+1) indices
-    _, topk_indices = torch.topk(probs, fan_out + 1, dim=-1)
-
-    # Create a mask for top positions
-    topf_mask = torch.zeros_like(probs, dtype=torch.bool)
-    topf_mask.scatter_(dim=-1, index=topk_indices, value=True)
-
-    # Rescale top probs by sampler_x factor
-    probs = torch.where(topf_mask, probs * sampler_x, probs)
-
-    # Renormalize
-    probs = probs / probs.sum(dim=-1, keepdim=True)
-
-    return probs
+    rescaled = probs.pow(sampler_x)
+    rescaled = rescaled / rescaled.sum(dim=-1, keepdim=True)
+    return rescaled
