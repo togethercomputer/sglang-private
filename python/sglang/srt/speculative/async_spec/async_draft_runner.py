@@ -34,6 +34,21 @@ from sglang.srt.speculative.async_spec.tree_utils import (
 logger = logging.getLogger(__name__)
 
 
+class _TreeDecodeKVSpec:
+    """Lightweight spec_info-like object for FlashInfer kv_indptr/kv_indices bypass.
+
+    When passed as forward_batch.spec_info, the FlashInfer backend's
+    call_begin_forward skips the Triton kernel and GPU cumsum, using
+    these precomputed values directly (see flashinfer_backend.py line 1103).
+    """
+
+    __slots__ = ("kv_indptr", "kv_indices")
+
+    def __init__(self, kv_indptr: torch.Tensor, kv_indices: torch.Tensor):
+        self.kv_indptr = kv_indptr
+        self.kv_indices = kv_indices
+
+
 class AsyncDraftRunner:
     """Runs on a dedicated GPU, receives spec requests, manages tree cache.
 
@@ -772,8 +787,19 @@ class AsyncDraftRunner:
                     )
         else:
             # ── Eager fallback path ──
-            # Batch GPU→CPU transfer for seq_lens_sums (1 sync instead of K)
+            # Batch GPU→CPU transfers (1 sync instead of K separate per-step syncs).
+            # This provides seq_lens_cpu to the FlashInfer backend so it avoids
+            # internal .cpu() transfers in call_begin_forward.
             step_seq_lens_sums_cpu = step_seq_lens_sums.cpu()  # [K]
+            step_ctx_lens_cpu = step_ctx_lens_expanded.cpu()  # [K, N]
+
+            # ── Pre-compute FlashInfer KV metadata for all K steps (SSD-style) ──
+            # This lets call_begin_forward skip the per-step Triton kernel +
+            # cumsum by passing kv_indptr & kv_indices via spec_info.
+            step_kv_specs = self._precompute_kv_specs(
+                K, N, seq_ids_expanded_i32, step_ctx_lens_expanded,
+                step_seq_lens_sums_cpu,
+            )
 
             # Reuse a single ForwardBatch, mutating fields each step
             forward_batch = ForwardBatch(
@@ -782,9 +808,11 @@ class AsyncDraftRunner:
                 input_ids=current_input_ids.to(torch.int32),
                 req_pool_indices=seq_ids_expanded_i32,
                 seq_lens=step_ctx_lens_expanded[0],
+                seq_lens_cpu=step_ctx_lens_cpu[0],
                 out_cache_loc=step_slot_maps_i32[0],
                 seq_lens_sum=int(step_seq_lens_sums_cpu[0]),
                 positions=step_rope_positions_i64[0],
+                spec_info=step_kv_specs[0] if step_kv_specs else None,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool=self.token_to_kv_pool,
                 attn_backend=self.attn_backend,
@@ -798,9 +826,12 @@ class AsyncDraftRunner:
                 # Update ForwardBatch fields in-place for this step
                 forward_batch.input_ids = current_input_ids.to(torch.int32)
                 forward_batch.seq_lens = step_ctx_lens_expanded[depth]
+                forward_batch.seq_lens_cpu = step_ctx_lens_cpu[depth]
                 forward_batch.out_cache_loc = step_slot_maps_i32[depth]
                 forward_batch.seq_lens_sum = int(step_seq_lens_sums_cpu[depth])
                 forward_batch.positions = step_rope_positions_i64[depth]
+                if step_kv_specs:
+                    forward_batch.spec_info = step_kv_specs[depth]
 
                 # Forward pass — call forward_decode directly
                 logits_output = self.model_runner.forward_decode(forward_batch)
@@ -863,6 +894,56 @@ class AsyncDraftRunner:
             f"Tree cache populated: {keys.shape[0]} entries, "
             f"tokens={tokens.shape}, logits={logits.shape}"
         )
+
+    # ── Pre-computed KV spec info for FlashInfer bypass ──
+
+    def _precompute_kv_specs(
+        self,
+        K: int,
+        N: int,
+        req_pool_indices: torch.Tensor,  # [N] int32
+        step_ctx_lens: torch.Tensor,  # [K, N] int32 GPU
+        step_sums_cpu: torch.Tensor,  # [K] CPU
+    ):
+        """Pre-compute kv_indptr + kv_indices for all K tree decode steps.
+
+        This matches SSD's step-0 precomputation: by providing kv_indptr and
+        kv_indices directly, the FlashInfer backend skips the per-step Triton
+        kernel (create_flashinfer_kv_indices_triton) and GPU cumsum.
+
+        Returns a list of K _TreeDecodeKVSpec objects, or [] if the backend
+        doesn't support the spec_info bypass (non-FlashInfer backends).
+        """
+        try:
+            req_to_token = self.req_to_token_pool.req_to_token
+        except AttributeError:
+            return []
+
+        specs = []
+        for s in range(K):
+            seq_lens_s = step_ctx_lens[s]  # [N] int32
+            # kv_indptr: cumulative sum of context lens per entry, [N+1]
+            kv_indptr = torch.zeros(N + 1, dtype=torch.int32, device=self.device)
+            kv_indptr[1:] = torch.cumsum(seq_lens_s, dim=0)
+            total_kv = int(step_sums_cpu[s])
+            # kv_indices: flatten req_to_token[rpi, 0:seq_len] for all N entries
+            kv_indices = torch.empty(total_kv, dtype=torch.int32, device=self.device)
+            # Use the same Triton kernel for extraction (runs once per step at
+            # precompute time, not during the hot decode loop)
+            from sglang.srt.layers.attention.utils import (
+                create_flashinfer_kv_indices_triton,
+            )
+            create_flashinfer_kv_indices_triton[(N,)](
+                req_to_token,
+                req_pool_indices,
+                seq_lens_s,
+                kv_indptr,
+                None,  # kv_start_idx
+                kv_indices,
+                req_to_token.shape[1],
+            )
+            specs.append(_TreeDecodeKVSpec(kv_indptr=kv_indptr, kv_indices=kv_indices))
+        return specs
 
     # ── Sampling ──
 
