@@ -262,14 +262,14 @@ class AsyncSpecWorker:
         all_draft_tokens = speculations.to(torch.long).flatten()
 
         # Build positions: [seq_len+0, seq_len+1, ..., seq_len+K] per request
+        # Vectorized: avoid B×(K+1) Python loop with .item() GPU→CPU syncs
         seq_lens_cpu = batch.seq_lens.cpu().to(torch.int32)
-        positions = torch.empty(
-            B * num_verify_tokens, dtype=torch.long, device=self.device
-        )
-        for b in range(B):
-            sl = batch.seq_lens[b].item()
-            for k in range(num_verify_tokens):
-                positions[b * num_verify_tokens + k] = sl + k
+        offsets = torch.arange(
+            num_verify_tokens, dtype=torch.long, device=self.device
+        )  # [K+1]
+        positions = (
+            batch.seq_lens.unsqueeze(1).to(torch.long) + offsets.unsqueeze(0)
+        ).reshape(-1)  # [B*(K+1)]
 
         # Build retrive_index: [0, 1, ..., K] per request (per-request indices)
         retrive_index = (
@@ -280,12 +280,12 @@ class AsyncSpecWorker:
         )
 
         # Build retrive_next_token: chain links [1, 2, ..., K, -1] per request
-        # These are per-request indices (0-based within each request's tokens)
-        retrive_next_token = torch.full(
-            (B, num_verify_tokens), -1, device=self.device, dtype=torch.long
+        # Vectorized: [1, 2, ..., K, -1] broadcast to all B rows
+        chain_links = torch.arange(
+            1, num_verify_tokens + 1, device=self.device, dtype=torch.long
         )
-        for k in range(K):
-            retrive_next_token[:, k] = k + 1
+        chain_links[-1] = -1  # Last token has no next
+        retrive_next_token = chain_links.unsqueeze(0).expand(B, -1).contiguous()
 
         # Build retrive_next_sibling: all -1 (no branches in chain)
         retrive_next_sibling = torch.full(
@@ -364,12 +364,11 @@ class AsyncSpecWorker:
         max_blocks = self.nccl_channel.max_blocks
 
         # Build cache_keys [B, 3], temperatures [B], num_tokens [B], block_tables [B, max_blocks]
-        cache_keys = torch.zeros(B, 3, dtype=torch.int64, device=self.device)
-        temperatures = torch.zeros(B, dtype=torch.float32, device=self.device)
-        num_tokens = torch.zeros(B, dtype=torch.int64, device=self.device)
-        block_tables = torch.zeros(
-            B, max_blocks, dtype=torch.int64, device=self.device
-        )
+        # Collect as CPU lists first, convert to GPU tensors once (avoids per-request torch.tensor calls)
+        cache_keys_list = []
+        temps_list = []
+        num_tokens_list = []
+        block_tables_list = []
 
         for i, req in enumerate(reqs):
             req_pool_idx = req.req_pool_idx if req.req_pool_idx is not None else 0
@@ -377,16 +376,15 @@ class AsyncSpecWorker:
             recovery_token = (
                 req.recovery_token_id if req.recovery_token_id is not None else 0
             )
-            cache_keys[i, 0] = req_pool_idx
-            cache_keys[i, 1] = accepted_len
-            cache_keys[i, 2] = recovery_token
-            temperatures[i] = req.sampling_params.temperature
+            cache_keys_list.append([req_pool_idx, accepted_len, recovery_token])
+            temps_list.append(req.sampling_params.temperature)
 
             # Populate num_tokens and block_tables from tracking
             rpi = req_pool_idx
+            bt_row = [0] * max_blocks
+            nt = 0
             if rpi in self.draft_num_tokens:
                 nt = self.draft_num_tokens[rpi]
-                num_tokens[i] = nt
 
                 # Ensure enough blocks for current tokens + tree decode
                 # Tree decode needs: K+1 (glue) + K*MQ_LEN (tree steps) extra positions
@@ -399,11 +397,17 @@ class AsyncSpecWorker:
                         new_blocks = self.draft_block_allocator.allocate(additional)
                         current_blocks.extend(new_blocks)
 
-                    # Pack block table
                     bt = current_blocks[:max_blocks]
-                    block_tables[i, : len(bt)] = torch.tensor(
-                        bt, dtype=torch.int64, device=self.device
-                    )
+                    bt_row[:len(bt)] = bt
+
+            num_tokens_list.append(nt)
+            block_tables_list.append(bt_row)
+
+        # Single CPU→GPU transfer per tensor (instead of B per-element writes)
+        cache_keys = torch.tensor(cache_keys_list, dtype=torch.int64, device=self.device)
+        temperatures = torch.tensor(temps_list, dtype=torch.float32, device=self.device)
+        num_tokens = torch.tensor(num_tokens_list, dtype=torch.int64, device=self.device)
+        block_tables = torch.tensor(block_tables_list, dtype=torch.int64, device=self.device)
 
         # Send request via NCCL
         self.nccl_channel.send_spec_request(

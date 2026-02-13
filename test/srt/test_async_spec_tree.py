@@ -414,6 +414,11 @@ class TestPopulateTreeCache(unittest.TestCase):
         )
 
         AsyncDraftRunner._init_prealloc_buffers(runner)
+        # Bind the vectorized fan_idx method so _populate_tree_cache can call it
+        import types
+        runner._vectorized_fan_idx = types.MethodType(
+            AsyncDraftRunner._vectorized_fan_idx, runner
+        )
         return runner
 
     def test_populate_and_lookup(self):
@@ -789,6 +794,160 @@ class TestBlockAllocation(unittest.TestCase):
         # Check exact values
         self.assertEqual(old_needed, (100 + 5 + 15) // 16)  # 7
         self.assertEqual(new_needed, (100 + 96 + 15) // 16)  # 13
+
+
+class TestVectorizedKVMapping(unittest.TestCase):
+    """Test that vectorized _update_kv_mapping matches per-element semantics."""
+
+    def test_vectorized_write(self):
+        """Test that advanced indexing write matches element-wise writes."""
+        from sglang.srt.speculative.async_spec.async_draft_runner import (
+            AsyncDraftRunner,
+        )
+
+        runner = MagicMock()
+        runner.page_size = 16
+        runner.device = torch.device("cpu")
+
+        # Create a small req_to_token_pool mock
+        pool = MagicMock()
+        pool.req_to_token = torch.zeros((4, 64), dtype=torch.int32)
+        runner.req_to_token_pool = pool
+
+        # Write some values
+        req_pool_indices = torch.tensor([0, 0, 1, 2, 2], dtype=torch.int64)
+        positions = torch.tensor([0, 5, 3, 10, 11], dtype=torch.int64)
+        slot_map = torch.tensor([100, 200, 300, 400, 500], dtype=torch.int32)
+
+        AsyncDraftRunner._update_kv_mapping(runner, req_pool_indices, positions, slot_map)
+
+        # Verify
+        self.assertEqual(pool.req_to_token[0, 0].item(), 100)
+        self.assertEqual(pool.req_to_token[0, 5].item(), 200)
+        self.assertEqual(pool.req_to_token[1, 3].item(), 300)
+        self.assertEqual(pool.req_to_token[2, 10].item(), 400)
+        self.assertEqual(pool.req_to_token[2, 11].item(), 500)
+
+    def test_bulk_write_all_steps(self):
+        """Test that bulk write of all K steps works correctly."""
+        from sglang.srt.speculative.async_spec.async_draft_runner import (
+            AsyncDraftRunner,
+        )
+
+        runner = MagicMock()
+        runner.page_size = 16
+        runner.device = torch.device("cpu")
+
+        pool = MagicMock()
+        pool.req_to_token = torch.zeros((2, 128), dtype=torch.int32)
+        runner.req_to_token_pool = pool
+
+        K, N = 3, 4  # 3 steps, 4 branches
+        # req_pool_indices repeated K times
+        rpis = torch.tensor([0, 0, 1, 1], dtype=torch.int64).repeat(K)  # [K*N]
+        # Positions: step 0 at [10..13], step 1 at [20..23], step 2 at [30..33]
+        positions = torch.cat([
+            torch.tensor([10, 11, 12, 13]),
+            torch.tensor([20, 21, 22, 23]),
+            torch.tensor([30, 31, 32, 33]),
+        ]).to(torch.int64)
+        slot_map = torch.arange(K * N, dtype=torch.int32) + 100
+
+        AsyncDraftRunner._update_kv_mapping(runner, rpis, positions, slot_map)
+
+        # Check step 0 writes
+        self.assertEqual(pool.req_to_token[0, 10].item(), 100)
+        self.assertEqual(pool.req_to_token[0, 11].item(), 101)
+        self.assertEqual(pool.req_to_token[1, 12].item(), 102)
+        self.assertEqual(pool.req_to_token[1, 13].item(), 103)
+        # Check step 2 writes
+        self.assertEqual(pool.req_to_token[0, 30].item(), 108)
+        self.assertEqual(pool.req_to_token[1, 33].item(), 111)
+
+
+class TestTreeCudaGraphRunnerBuckets(unittest.TestCase):
+    """Test TreeDecodeCudaGraphRunner bucket size computation."""
+
+    def test_bucket_sizes(self):
+        from sglang.srt.speculative.async_spec.tree_cuda_graph_runner import (
+            TreeDecodeCudaGraphRunner,
+        )
+
+        # max_batch_size=8, mq_len=18
+        buckets = TreeDecodeCudaGraphRunner._compute_bucket_sizes(8, 18)
+        # Should include: 1*18=18, 2*18=36, 4*18=72, 8*18=144
+        self.assertIn(18, buckets)
+        self.assertIn(36, buckets)
+        self.assertIn(72, buckets)
+        self.assertIn(144, buckets)
+        self.assertEqual(buckets, sorted(buckets))  # Should be sorted
+
+    def test_bucket_sizes_non_power_of_2(self):
+        from sglang.srt.speculative.async_spec.tree_cuda_graph_runner import (
+            TreeDecodeCudaGraphRunner,
+        )
+
+        # max_batch_size=5, mq_len=8
+        buckets = TreeDecodeCudaGraphRunner._compute_bucket_sizes(5, 8)
+        # Should include: 1*8=8, 2*8=16, 4*8=32, 5*8=40
+        self.assertIn(8, buckets)
+        self.assertIn(16, buckets)
+        self.assertIn(32, buckets)
+        self.assertIn(40, buckets)  # Max always included
+
+    def test_bucket_sizes_single(self):
+        from sglang.srt.speculative.async_spec.tree_cuda_graph_runner import (
+            TreeDecodeCudaGraphRunner,
+        )
+
+        buckets = TreeDecodeCudaGraphRunner._compute_bucket_sizes(1, 6)
+        self.assertEqual(buckets, [6])
+
+    def test_bucket_sizes_zero(self):
+        from sglang.srt.speculative.async_spec.tree_cuda_graph_runner import (
+            TreeDecodeCudaGraphRunner,
+        )
+
+        buckets = TreeDecodeCudaGraphRunner._compute_bucket_sizes(0, 18)
+        self.assertEqual(buckets, [])
+
+
+class TestBenchmarkVectorizedKVMapping(unittest.TestCase):
+    """Benchmark vectorized vs per-element KV mapping."""
+
+    def test_benchmark_vectorized_kv_mapping(self):
+        """Benchmark vectorized _update_kv_mapping."""
+        from sglang.srt.speculative.async_spec.async_draft_runner import (
+            AsyncDraftRunner,
+        )
+
+        runner = MagicMock()
+        runner.page_size = 16
+        runner.device = torch.device("cpu")
+
+        pool = MagicMock()
+        pool.req_to_token = torch.zeros((64, 1024), dtype=torch.int32)
+        runner.req_to_token_pool = pool
+
+        # Simulate K*N entries: K=5, B=8, mq_len=18 → N=144, K*N=720
+        K_N = 720
+        rpis = torch.randint(0, 64, (K_N,), dtype=torch.int64)
+        positions = torch.randint(0, 1024, (K_N,), dtype=torch.int64)
+        slot_map = torch.randint(0, 10000, (K_N,), dtype=torch.int32)
+
+        # Warmup
+        for _ in range(3):
+            AsyncDraftRunner._update_kv_mapping(runner, rpis, positions, slot_map)
+
+        # Benchmark
+        n_iters = 1000
+        start = time.perf_counter()
+        for _ in range(n_iters):
+            AsyncDraftRunner._update_kv_mapping(runner, rpis, positions, slot_map)
+        elapsed = (time.perf_counter() - start) / n_iters * 1000
+        print(f"\n[BENCH] vectorized _update_kv_mapping: {elapsed:.3f}ms (K*N={K_N})")
+        # Should be well under 1ms on CPU
+        self.assertLess(elapsed, 10, f"Vectorized KV mapping too slow: {elapsed:.1f}ms")
 
 
 if __name__ == "__main__":
