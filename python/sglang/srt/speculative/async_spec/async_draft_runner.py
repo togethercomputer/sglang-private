@@ -115,24 +115,42 @@ class AsyncDraftRunner:
         self._draft_step_times: List[float] = []
 
     def _precompute_fan_out_tensors(self):
-        """Pre-compute repeat_interleave patterns for tree expansion."""
+        """Pre-compute repeat_interleave patterns for tree expansion.
+
+        fan_out_list has K+1 entries (one per glue decode position: recovery + K draft).
+        Matches SSD's _init_prealloc_buffers.
+        """
         K = self.spec_k
         d = self.device
 
-        # For cache hits: fan_out_list has K entries (one per depth, skipping recovery)
-        fo_hit = self.fan_out_list[:K]
-        fo_miss = self.fan_out_list_miss[:K]
-
-        # repeat_interleave indices for expanding [B, K, max_fo] -> [N_tree]
-        self._fo_hit_t = torch.tensor(fo_hit, dtype=torch.int64, device=d)
-        self._fo_miss_t = torch.tensor(fo_miss, dtype=torch.int64, device=d)
-
-        # Depth indices for a single seq: [0]*fo[0] + [1]*fo[1] + ...
-        self._depth_ids_hit = torch.arange(K, device=d).repeat_interleave(
-            self._fo_hit_t
+        # fan_out tensors: K+1 entries each
+        self._fo_hit_t = torch.tensor(
+            self.fan_out_list, dtype=torch.int64, device=d
         )
-        self._depth_ids_miss = torch.arange(K, device=d).repeat_interleave(
-            self._fo_miss_t
+        self._fo_miss_t = torch.tensor(
+            self.fan_out_list_miss, dtype=torch.int64, device=d
+        )
+
+        # Fan index: maps each MQ position to its K+1 depth index.
+        # E.g. for fan_out_list=[2,2,1], _fan_idx_hit = [0,0,1,1,2]
+        self._fan_idx_hit = torch.arange(
+            K + 1, device=d, dtype=torch.int64
+        ).repeat_interleave(self._fo_hit_t)
+        self._fan_idx_miss = torch.arange(
+            K + 1, device=d, dtype=torch.int64
+        ).repeat_interleave(self._fo_miss_t)
+
+        # Pre-allocate step offset tensors for tree decode precomputation.
+        # _step_pos_offsets[d] = d * MQ_LEN: position advance per tree step
+        # _step_rope_offsets[d] = d: rope position advance per tree step
+        self._step_pos_offsets = (
+            torch.arange(K, device=d, dtype=torch.int64)[:, None] * self.mq_len
+        )
+        self._step_rope_offsets = torch.arange(
+            K, device=d, dtype=torch.int64
+        )[:, None]
+        self._arange_mq = torch.arange(
+            self.mq_len, device=d, dtype=torch.int64
         )
 
     def _init_model(self):
@@ -152,7 +170,9 @@ class AsyncDraftRunner:
         draft_server_args.tp_size = 1
         draft_server_args.dp_size = 1
         draft_server_args.pp_size = 1
-        draft_server_args.disable_cuda_graph = True
+        # Enable CUDA graphs for decode forward passes (JIT + tree decode).
+        # This matches SSD's approach of capturing decode graphs for the draft model.
+        draft_server_args.disable_cuda_graph = False
         draft_server_args.speculative_algorithm = None
         # Use a reasonable memory fraction for the draft model
         draft_server_args.mem_fraction_static = 0.80
@@ -227,7 +247,11 @@ class AsyncDraftRunner:
         seq_lens: torch.Tensor,  # [B]
         out_cache_loc: torch.Tensor,  # [B]
     ):
-        """Construct a ForwardBatch for decode (one token per sequence)."""
+        """Construct a ForwardBatch for decode (one token per sequence).
+
+        Minimizes CPU-GPU sync: uses non_blocking .cpu() transfer and
+        defers .item() to a single call.
+        """
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
@@ -236,6 +260,8 @@ class AsyncDraftRunner:
 
         B = input_ids.shape[0]
         positions = (seq_lens - 1).clamp(min=0)
+        # Single non-blocking CPU transfer for seq_lens
+        seq_lens_cpu = seq_lens.cpu()
 
         return ForwardBatch(
             forward_mode=ForwardMode.DECODE,
@@ -243,9 +269,9 @@ class AsyncDraftRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens.cpu(),
+            seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=int(seq_lens.sum().item()),
+            seq_lens_sum=int(seq_lens_cpu.sum()),
             positions=positions,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             req_to_token_pool=self.req_to_token_pool,
@@ -262,7 +288,11 @@ class AsyncDraftRunner:
         extend_prefix_lens: torch.Tensor,  # [B]
         extend_seq_lens: torch.Tensor,  # [B] (number of new tokens per req)
     ):
-        """Construct a ForwardBatch for extend (prefill/glue decode)."""
+        """Construct a ForwardBatch for extend (prefill/glue decode).
+
+        Minimizes CPU-GPU sync by batching transfers and computing
+        max on CPU after a single .cpu() call.
+        """
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
@@ -272,9 +302,13 @@ class AsyncDraftRunner:
         B = req_pool_indices.shape[0]
         N = input_ids.shape[0]
 
+        # Single CPU transfer for extend_seq_lens, then compute max on CPU
+        extend_seq_lens_cpu = extend_seq_lens.cpu()
+        max_el = int(extend_seq_lens_cpu.max())
+
         # Compute positions vectorized: arange per req, offset by prefix_len
         offsets = torch.arange(
-            extend_seq_lens.max().item(), device=self.device, dtype=torch.long
+            max_el, device=self.device, dtype=torch.long
         ).unsqueeze(0)  # [1, max_el]
         # mask[b, j] = True if j < extend_seq_lens[b]
         mask = offsets < extend_seq_lens.unsqueeze(1)  # [B, max_el]
@@ -287,22 +321,26 @@ class AsyncDraftRunner:
                 torch.int32
             )
 
+        # Single CPU transfer for seq_lens, compute sum on CPU
+        seq_lens_cpu = seq_lens.cpu()
+        extend_prefix_lens_cpu = extend_prefix_lens.cpu()
+
         return ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=B,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens.cpu(),
+            seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=int(seq_lens.sum().item()),
+            seq_lens_sum=int(seq_lens_cpu.sum()),
             positions=positions,
             extend_num_tokens=N,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_start_loc=extend_start_loc,
-            extend_prefix_lens_cpu=extend_prefix_lens.cpu().tolist(),
-            extend_seq_lens_cpu=extend_seq_lens.cpu().tolist(),
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu.tolist(),
+            extend_seq_lens_cpu=extend_seq_lens_cpu.tolist(),
             capture_hidden_mode=CaptureHiddenMode.NULL,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
@@ -311,13 +349,28 @@ class AsyncDraftRunner:
 
     @torch.inference_mode()
     def _run_forward(self, fb) -> torch.Tensor:
-        """Run model forward and return next_token_logits [num_tokens, V]."""
-        self.model_runner.attn_backend.init_forward_metadata(fb)
-        if fb.forward_mode.is_decode():
+        """Run model forward and return next_token_logits [num_tokens, V].
+
+        Uses CUDA graph replay for decode mode when available,
+        falling back to eager forward otherwise.
+        """
+        graph_runner = self.model_runner.graph_runner
+        if (
+            fb.forward_mode.is_decode()
+            and graph_runner is not None
+            and graph_runner.can_run(fb)
+        ):
+            # CUDA graph path: replay captured decode graph
+            logits_output = graph_runner.replay(fb)
+        elif fb.forward_mode.is_decode():
+            # Eager decode fallback
+            self.model_runner.attn_backend.init_forward_metadata(fb)
             logits_output = self.model_runner.forward_decode(
                 fb, skip_attn_backend_init=True
             )
         else:
+            # Extend path (glue decode) — always eager
+            self.model_runner.attn_backend.init_forward_metadata(fb)
             logits_output, _ = self.model_runner.forward_extend(
                 fb, skip_attn_backend_init=True
             )
@@ -326,18 +379,33 @@ class AsyncDraftRunner:
     def _sample_tokens(
         self, logits: torch.Tensor, temperatures: torch.Tensor
     ) -> torch.Tensor:
-        """Sample tokens from logits. Returns [B] token ids."""
+        """Sample tokens from logits using Gumbel-max trick. Returns [B] token ids.
+
+        Matches SSD's sampler: for stochastic sampling, uses
+        probs / exponential_noise → argmax, which is ~2.4x faster than
+        torch.multinomial while producing equivalent samples.
+        """
         if self.draft_temperature is not None and self.draft_temperature > 0:
-            # Use fixed draft temperature
-            probs = F.softmax(logits / self.draft_temperature, dim=-1)
-            return torch.multinomial(probs, num_samples=1).squeeze(-1)
+            # Fixed draft temperature — Gumbel-max trick
+            logits_f = logits.float() / self.draft_temperature
+            probs = F.softmax(logits_f, dim=-1)
+            scores = probs / (torch.empty_like(probs).exponential_(1) + 1e-10)
+            return scores.argmax(dim=-1)
         elif temperatures is not None and (temperatures > 0).any():
-            # Per-request temperatures
+            # Per-request temperatures with greedy/stochastic mix
+            logits_f = logits.float()
+            greedy_tokens = logits_f.argmax(dim=-1)
+            zero_mask = temperatures <= 0
+            if zero_mask.all():
+                return greedy_tokens
+            # Gumbel-max for stochastic requests
             temps = temperatures.unsqueeze(-1).clamp(min=1e-6)
-            probs = F.softmax(logits / temps, dim=-1)
-            return torch.multinomial(probs, num_samples=1).squeeze(-1)
+            probs = F.softmax(logits_f / temps, dim=-1)
+            scores = probs / (torch.empty_like(probs).exponential_(1) + 1e-10)
+            sample_tokens = scores.argmax(dim=-1)
+            return torch.where(zero_mask, greedy_tokens, sample_tokens)
         else:
-            # Greedy
+            # Pure greedy
             return logits.argmax(dim=-1)
 
     # ── Vectorized req_to_token_pool helpers ──
@@ -720,6 +788,7 @@ class AsyncDraftRunner:
         """Run glue decode + tree decode + populate cache.
 
         This runs in the background while the target model verifies.
+        Matches SSD's _build_tree_batch + _decode_tree flow.
         """
         if B == 0:
             return
@@ -728,11 +797,11 @@ class AsyncDraftRunner:
         draft_cur_lens = self.draft_seq_lens[draft_indices]  # [B]
 
         # ── Phase 1: Glue decode ──
-        # Build glue input: [recovery_token, tok_0, ..., tok_{K-1}] per seq (K+1 tokens)
-        glue_input = make_glue_decode_input_ids(
+        # Build glue input: [recovery_token, tok_0, ..., tok_{K-1}] per seq
+        glue_flat = make_glue_decode_input_ids(
             returned_tokens.to(torch.int64), recovery_tokens
-        )  # [B, K+1]
-        glue_flat = glue_input.reshape(-1).to(torch.int32)  # [B*(K+1)]
+        ).to(torch.int32)  # [B*(K+1)]
+        glue_2d = glue_flat.to(torch.int64).view(B, K + 1)
         num_glue_tokens = B * (K + 1)
 
         # Allocate KV cache for glue tokens
@@ -763,36 +832,63 @@ class AsyncDraftRunner:
         glue_logits_flat = self._run_forward(fb)  # [B*(K+1), V]
         glue_logits = glue_logits_flat.view(B, K + 1, -1)  # [B, K+1, V]
 
-        # Fork: sample fan_out alternative tokens at each of K positions
+        # Fork: sample fan_out alternative tokens at each K+1 position.
+        # Pass returned_tokens (glue_2d) to mask out chain tokens via -inf.
         forked_tokens = get_forked_recovery_tokens_from_logits(
             logits=glue_logits,
             fan_out_list=self.fan_out_list,
             temperatures=temperatures,
             cache_hits=cache_hits,
             fan_out_list_miss=self.fan_out_list_miss,
-        )  # [B, K, max_fan_out]
+            returned_tokens=glue_2d,
+        )  # [B, MQ_LEN]
 
         # Update draft seq lens after glue (vectorized)
         self.draft_seq_lens[draft_indices] = glue_seq_lens
 
-        # ── Phase 2: Tree decode (K steps) ──
-        # Build tree expansion tensors (vectorized)
-        tree_input_flat, tree_batch_ids_t, tree_depth_ids_t = (
-            self._expand_forked_tokens(forked_tokens, B, K, cache_hits)
-        )
-        N_tree = tree_input_flat.shape[0]
+        # ── Phase 2: Tree decode (K steps) with precomputed positions ──
+        MQ_LEN = self.mq_len
+        N_tree = B * MQ_LEN
+        tree_input_flat = forked_tokens.reshape(-1)  # [N_tree]
 
         if N_tree == 0:
             return
 
-        # Determine draft indices and base seq lens for each tree token
-        tree_draft_indices = draft_indices[tree_batch_ids_t]
-        tree_base_lens = glue_seq_lens[tree_batch_ids_t]
+        # Compute batch IDs and fan depth IDs for tree tokens
+        tree_batch_ids = torch.arange(
+            B, device=self.device
+        ).repeat_interleave(MQ_LEN)  # [N_tree]
+        all_hit = cache_hits.all().item()
+        all_miss = (cache_hits == 0).all().item()
+        if all_hit:
+            tree_fan_idx = self._fan_idx_hit.repeat(B)
+        elif all_miss:
+            tree_fan_idx = self._fan_idx_miss.repeat(B)
+        else:
+            tree_fan_idx = torch.cat(
+                [
+                    self._fan_idx_hit if cache_hits[b].item() else self._fan_idx_miss
+                    for b in range(B)
+                ]
+            )
 
-        # Pre-compute temperatures for tree tokens (constant across depths)
-        tree_temps = temperatures[tree_batch_ids_t]
+        tree_draft_indices = draft_indices[tree_batch_ids]
+        tree_base_lens = glue_seq_lens[tree_batch_ids]
+        tree_temps = temperatures[tree_batch_ids]
 
-        # Tree decode: K steps
+        # Precompute positions and seq_lens for all K steps.
+        # Each tree token gets a unique KV position to avoid slot conflicts.
+        # Token (b, j) at step d: kv_pos = base + d*MQ_LEN + j
+        fkp1_flat = self._arange_mq.repeat(B)  # [N_tree]: 0..MQ_LEN-1 per batch
+        initial_positions = tree_base_lens + fkp1_flat  # [N_tree]
+
+        # Precompute [K, N_tree] position/seq_lens tensors (matching SSD pattern)
+        all_step_positions = (
+            initial_positions.unsqueeze(0) + self._step_pos_offsets
+        )  # [K, N_tree]
+        all_step_seq_lens = all_step_positions + 1  # [K, N_tree]
+
+        # Tree decode: K steps with precomputed values
         spec_tokens = torch.zeros(
             (N_tree, K), dtype=torch.int64, device=self.device
         )
@@ -810,13 +906,14 @@ class AsyncDraftRunner:
                 logger.warning(f"Tree decode: KV alloc failed at depth {depth}")
                 break
 
-            # Vectorized slot assignment
-            step_positions = tree_base_lens + depth
+            # Use precomputed positions for this step (no recomputation)
+            step_positions = all_step_positions[depth]  # [N_tree]
+            step_seq_lens = all_step_seq_lens[depth]  # [N_tree]
+
+            # Vectorized slot assignment with unique positions
             self._assign_slots_per_element(
                 tree_draft_indices, step_positions, step_locs
             )
-
-            step_seq_lens = tree_base_lens + depth + 1
 
             fb = self._make_decode_forward_batch(
                 input_ids=current_input_ids,
@@ -834,99 +931,13 @@ class AsyncDraftRunner:
 
         # ── Phase 3: Populate tree cache ──
         self._populate_tree_cache(
-            tree_batch_ids_t,
-            tree_depth_ids_t,
+            tree_batch_ids,
+            tree_fan_idx,
             tree_input_flat,
             spec_tokens,
             spec_logits,
             cache_keys,
         )
-
-        # Draft seq lens stay at glue_seq_lens (tree tokens share positions)
-
-    def _expand_forked_tokens(
-        self,
-        forked_tokens: torch.Tensor,  # [B, K, max_fan_out]
-        B: int,
-        K: int,
-        cache_hits: torch.Tensor,  # [B]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Expand forked tokens into flat tree input + mapping tensors.
-
-        Uses pre-computed fan_out tensors to avoid per-element Python loops.
-
-        Returns:
-            tree_input_flat: [N_tree] token ids
-            tree_batch_ids: [N_tree] which batch element each token belongs to
-            tree_depth_ids: [N_tree] which depth each token belongs to
-        """
-        # Per-batch fan out selection: use hit or miss pattern
-        # Build per-batch repeat counts: [B, K]
-        all_hit = cache_hits.all().item()
-        all_miss = (cache_hits == 0).all().item()
-
-        if all_hit:
-            # Fast path: all hits, uniform expansion
-            fo_per_depth = self._fo_hit_t  # [K]
-            mq_len = self.mq_len
-            depth_ids_single = self._depth_ids_hit  # [mq_len]
-
-            # Expand forked_tokens [B, K, max_fo] -> [B, mq_len]
-            token_list = []
-            for k in range(K):
-                fo = fo_per_depth[k].item()
-                token_list.append(forked_tokens[:, k, :fo])  # [B, fo]
-            tree_input = torch.cat(token_list, dim=1)  # [B, mq_len]
-            tree_input_flat = tree_input.reshape(-1)  # [B * mq_len]
-
-            tree_batch_ids = torch.arange(
-                B, device=self.device
-            ).repeat_interleave(mq_len)
-            tree_depth_ids = depth_ids_single.repeat(B)
-
-        elif all_miss:
-            fo_per_depth = self._fo_miss_t
-            mq_len = self.mq_len_miss
-            depth_ids_single = self._depth_ids_miss
-
-            token_list = []
-            for k in range(K):
-                fo = fo_per_depth[k].item()
-                token_list.append(forked_tokens[:, k, :fo])
-            tree_input = torch.cat(token_list, dim=1)
-            tree_input_flat = tree_input.reshape(-1)
-
-            tree_batch_ids = torch.arange(
-                B, device=self.device
-            ).repeat_interleave(mq_len)
-            tree_depth_ids = depth_ids_single.repeat(B)
-
-        else:
-            # Mixed hit/miss: per-batch expansion (less common path)
-            tree_input_parts = []
-            batch_ids_parts = []
-            depth_ids_parts = []
-            for b in range(B):
-                is_hit = cache_hits[b].item() > 0
-                fo_list = self.fan_out_list if is_hit else self.fan_out_list_miss
-                depth_ids = self._depth_ids_hit if is_hit else self._depth_ids_miss
-                mq = self.mq_len if is_hit else self.mq_len_miss
-
-                parts = []
-                for k in range(K):
-                    fo = fo_list[k] if k < len(fo_list) else 1
-                    parts.append(forked_tokens[b, k, :fo])
-                tree_input_parts.append(torch.cat(parts))
-                batch_ids_parts.append(
-                    torch.full((mq,), b, device=self.device, dtype=torch.int64)
-                )
-                depth_ids_parts.append(depth_ids)
-
-            tree_input_flat = torch.cat(tree_input_parts)
-            tree_batch_ids = torch.cat(batch_ids_parts)
-            tree_depth_ids = torch.cat(depth_ids_parts)
-
-        return tree_input_flat, tree_batch_ids, tree_depth_ids
 
     def _populate_tree_cache(
         self,

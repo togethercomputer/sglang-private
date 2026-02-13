@@ -2468,11 +2468,12 @@ class ServerArgs:
             self.speculative_eagle_topk = 1
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
-            # Compute fan_out_list defaults from fan_out and num_steps
+            # Compute fan_out_list defaults from fan_out and num_steps.
+            # K+1 entries: one per glue decode position (recovery + K draft).
             if self.speculative_async_fan_out_list is None:
                 self.speculative_async_fan_out_list = [
                     self.speculative_async_fan_out
-                ] * self.speculative_num_steps
+                ] * (self.speculative_num_steps + 1)
             if self.speculative_async_fan_out_list_miss is None:
                 self.speculative_async_fan_out_list_miss = (
                     self.speculative_async_fan_out_list
