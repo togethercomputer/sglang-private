@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    ASYNC_SPEC = auto()
     NONE = auto()
 
     @classmethod
@@ -45,6 +46,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_async_spec(self) -> bool:
+        return self == SpeculativeAlgorithm.ASYNC_SPEC
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
