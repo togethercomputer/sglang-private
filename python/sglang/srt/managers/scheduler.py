@@ -608,8 +608,8 @@ class Scheduler(
             dp_rank=self.dp_rank,
             moe_ep_rank=self.moe_ep_rank,
             nccl_port=self.nccl_port,
-            nccl_channel=nccl_channel,
             target_worker=self.tp_worker,
+            nccl_channel=nccl_channel,
         )
 
     def init_model_worker(self):
