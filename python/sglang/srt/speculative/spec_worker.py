@@ -130,12 +130,10 @@ class SpecWorker(TpModelWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_attention_tp_group())
-        else:
-            ctx = empty_context()
-
-        with ctx, speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        contexts = self._get_context_managers_for_draft(
+            return_empty_contexts=server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3()
+        )
+        with contexts[0], contexts[1], contexts[2]:
             # Among other things, this sets self._model_runner, which is the draft model runner.
             super().__init__(
                 server_args=server_args,
@@ -170,9 +168,8 @@ class SpecWorker(TpModelWorker):
                 "use_aux_hidden_state", True
             )
 
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        contexts = self._get_context_managers_for_draft()
+        with contexts[0], contexts[1], contexts[2]:
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -182,6 +179,14 @@ class SpecWorker(TpModelWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
+
+    def _get_context_managers_for_draft(self, return_empty_contexts: bool = False):
+        # Return context managers for draft worker
+        if not return_empty_contexts:
+            ctx = draft_tp_context(get_attention_tp_group())
+            return (ctx, speculative_moe_backend_context(), speculative_moe_a2a_backend_context())
+        else:
+            return (empty_context(), empty_context(), empty_context())
 
     def _set_embed_and_head_from_target(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -293,9 +298,8 @@ class SpecWorker(TpModelWorker):
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
             )
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            contexts = self._get_context_managers_for_draft()
+            with contexts[0], contexts[1], contexts[2]:
                 self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
@@ -310,17 +314,15 @@ class SpecWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            contexts = self._get_context_managers_for_draft()
+            with contexts[0], contexts[1], contexts[2]:
                 spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
+            logits_output, verify_output, _, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
 
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            contexts = self._get_context_managers_for_draft()
+            with contexts[0], contexts[1], contexts[2]:
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
@@ -383,6 +385,19 @@ class SpecWorker(TpModelWorker):
             model_worker_batch.seq_lens_cpu,
         )
 
+    def _get_alloc_len_per_decode(self) -> int:
+        # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
+        return self.speculative_num_steps * self.topk
+
+    def _can_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        if forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+            return (
+                self.cuda_graph_runner_for_draft_extend
+                and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+            )
+        else:
+            return self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch)
+
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()
         for req in batch.reqs:
@@ -404,14 +419,15 @@ class SpecWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
-            alloc_len_per_decode = self.speculative_num_steps * self.topk
-            # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
+            alloc_len_for_speculation = self._get_alloc_len_for_speculation()
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
-                num_seqs * alloc_len_per_decode,
+                num_seqs * alloc_len_for_speculation,
                 backup_state=True,
             )
         else:
+            if self.speculative_algorithm.is_async():
+                raise NotImplementedError("Async spec is not supported for page size > 1")
             if self.topk == 1:
                 prefix_lens, seq_lens, last_loc = get_last_loc_large_page_size_top_k_1(
                     batch.req_to_token_pool.req_to_token,
@@ -552,10 +568,7 @@ class SpecWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-        can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch
-        )
-        if can_cuda_graph:
+        if self._can_cuda_graph(forward_batch):
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
             )
@@ -566,9 +579,10 @@ class SpecWorker(TpModelWorker):
                 and self.speculative_num_steps > 1
             ):
                 # Skip attention backend init for idle mode or 1-step draft
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
+                if self.draft_attn_backend is not None:
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
+            parent_list, top_scores_index, draft_tokens = self._draft_forward(
                 forward_batch
             )
 
@@ -614,7 +628,7 @@ class SpecWorker(TpModelWorker):
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
-    def draft_forward(self, forward_batch: ForwardBatch):
+    def _draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -860,6 +874,12 @@ class SpecWorker(TpModelWorker):
             model=self.target_worker.model_runner.model,
         )
 
+    def _draft_extend_forward_pass(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        return self.draft_model_runner.forward(forward_batch).logits_output
+
+    def _prepare_for_extend(self, batch: ScheduleBatch):
+        batch.spec_info.prepare_for_extend(batch)
+
     def forward_draft_extend(
         self,
         batch: ScheduleBatch,
@@ -882,7 +902,7 @@ class SpecWorker(TpModelWorker):
             num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
+        self._prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
@@ -893,12 +913,12 @@ class SpecWorker(TpModelWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
-        logits_output = self.draft_model_runner.forward(forward_batch).logits_output
+        logits_output = self._draft_extend_forward_pass(forward_batch)
         if self.enable_nan_detection:
             detect_nan(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self._capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
@@ -952,11 +972,7 @@ class SpecWorker(TpModelWorker):
             forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
 
         # Run
-        can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
-        )
-        if can_cuda_graph:
+        if self._can_cuda_graph(forward_batch):
             logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
             )
@@ -990,7 +1006,7 @@ class SpecWorker(TpModelWorker):
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
 
-    def capture_for_decode(
+    def _capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)

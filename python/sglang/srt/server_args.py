@@ -32,6 +32,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -473,6 +474,14 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+
+    # Speculative decoding (async spec)
+    speculative_async_fan_out: int = 3
+    speculative_async_fan_out_list: Optional[List[int]] = None
+    speculative_async_fan_out_list_miss: Optional[List[int]] = None
+    speculative_async_jit_speculate: bool = True
+    speculative_async_sampler_x: Optional[float] = None
+    speculative_async_draft_temperature: Optional[float] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -2264,6 +2273,8 @@ class ServerArgs:
                 )
 
     def _handle_speculative_decoding(self):
+        speculative_algorithm = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
+
         if (
             self.speculative_draft_model_path is not None
             and self.speculative_draft_model_revision is None
@@ -2288,6 +2299,14 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if not speculative_algorithm.is_none():
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. "
+                    "You can override this by explicitly setting --max-running-requests."
+                )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -2295,16 +2314,7 @@ class ServerArgs:
                     "Currently standalone speculative decoding does not support dp attention."
                 )
 
-            if self.max_running_requests is None:
-                self.max_running_requests = 48
-                logger.warning(
-                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-                )
-
-            if (
-                self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
-                and envs.SGLANG_ENABLE_SPEC_V2.get()
-            ):
+            if envs.SGLANG_ENABLE_SPEC_V2.get():
                 self.disable_overlap_schedule = False
                 logger.warning(
                     "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
@@ -2393,16 +2403,10 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
-        if self.speculative_algorithm == "NGRAM":
+        elif speculative_algorithm.is_ngram():
             if not self.device.startswith("cuda"):
                 raise ValueError(
                     "Ngram speculative decoding only supports CUDA device."
-                )
-
-            if self.max_running_requests is None:
-                self.max_running_requests = 48
-                logger.warning(
-                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
             self.disable_overlap_schedule = True
@@ -2433,6 +2437,50 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+
+        elif speculative_algorithm.is_async():
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "Async speculative decoding requires --speculative-draft-model-path to be set."
+                )
+
+            if self.page_size != 1:
+                logger.warning(
+                    "Page size is reset to 1 for async speculative decoding."
+                )
+                self.page_size = 1
+
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            self.enable_dp_attention = False
+            logger.warning(
+                "Overlap scheduler, mixed chunked prefill, and dp attention are disabled for async speculative decoding."
+            )
+
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 5
+
+            # Set eagle_topk to 1 for async spec (no tree branching on target side)
+            self.speculative_eagle_topk = 1
+            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
+            # Compute fan_out_list defaults from fan_out and num_steps
+            if self.speculative_async_fan_out_list is None:
+                self.speculative_async_fan_out_list = [
+                    self.speculative_async_fan_out
+                ] * (self.speculative_num_steps + 1)  # K+1 entries for K+1 glue decode positions
+            if self.speculative_async_fan_out_list_miss is None:
+                self.speculative_async_fan_out_list_miss = (
+                    self.speculative_async_fan_out_list
+                )
+            # Validate that hit and miss fan_out_lists have the same total
+            # (required for the flat tensor reshape in get_forked_recovery_tokens)
+            assert sum(self.speculative_async_fan_out_list) == sum(
+                self.speculative_async_fan_out_list_miss
+            ), (
+                f"sum(fan_out_list)={sum(self.speculative_async_fan_out_list)} "
+                f"!= sum(fan_out_list_miss)={sum(self.speculative_async_fan_out_list_miss)}"
+            )
 
     def _handle_load_format(self):
         if (
@@ -3845,7 +3893,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "ASYNC_SPEC"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3992,6 +4040,44 @@ class ServerArgs:
             "--enable-multi-layer-eagle",
             action="store_true",
             help="Enable multi-layer Eagle speculative decoding.",
+        )
+
+        # Async speculative decoding
+        parser.add_argument(
+            "--speculative-async-fan-out",
+            type=int,
+            default=ServerArgs.speculative_async_fan_out,
+            help="Fan-out F for tree branches in async speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-async-fan-out-list",
+            type=json_list_type,
+            default=ServerArgs.speculative_async_fan_out_list,
+            help="Per-depth fan-out list for cache hits in async speculative decoding (JSON list of ints).",
+        )
+        parser.add_argument(
+            "--speculative-async-fan-out-list-miss",
+            type=json_list_type,
+            default=ServerArgs.speculative_async_fan_out_list_miss,
+            help="Per-depth fan-out list for cache misses in async speculative decoding (JSON list of ints).",
+        )
+        parser.add_argument(
+            "--speculative-async-jit-speculate",
+            type=lambda x: x.lower() in ("true", "1", "yes"),
+            default=ServerArgs.speculative_async_jit_speculate,
+            help="Generate tokens on cache miss vs random in async speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-async-sampler-x",
+            type=float,
+            default=ServerArgs.speculative_async_sampler_x,
+            help="Draft distribution rescaling factor for async speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-async-draft-temperature",
+            type=float,
+            default=ServerArgs.speculative_async_draft_temperature,
+            help="Override draft model temperature for async speculative decoding.",
         )
 
         # Expert parallelism

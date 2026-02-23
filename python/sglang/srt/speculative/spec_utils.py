@@ -707,6 +707,8 @@ def draft_tp_context(tp_group: GroupCoordinator):
 
 
 def detect_nan(logits_output: LogitsProcessorOutput):
+    if logits_output is None:
+        return
     logits = logits_output.next_token_logits
     if torch.any(torch.isnan(logits)):
         logger.error("Detected errors during sampling! NaN in the logits.")

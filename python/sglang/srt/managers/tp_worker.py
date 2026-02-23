@@ -288,18 +288,21 @@ class TpModelWorker(BaseTpWorker):
             self.max_req_len > 0 and self.max_req_input_len > 0
         ), "Memory pool size is too small"
 
-        # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
-        set_random_seed(self.random_seed)
+        self._set_random_seed(server_args.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+
+    def _set_random_seed(self, seed: int):
+        # Sync random seed across TP workers
+        self.random_seed = broadcast_pyobj(
+            [seed],
+            self.tp_size * self.pp_rank + self.tp_rank,
+            self.world_group.cpu_group,
+            src=self.world_group.ranks[0],
+        )[0]
+        set_random_seed(self.random_seed)
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig

@@ -22,7 +22,6 @@ class SpeculativeAlgorithm(Enum):
     ASYNC_STANDALONE = auto()
     ASYNC_EAGLE = auto()
     ASYNC_EAGLE3 = auto()
-    ASYNC_STANDALONE = auto()
     NONE = auto()
 
     @classmethod
