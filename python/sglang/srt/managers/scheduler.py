@@ -515,7 +515,7 @@ class Scheduler(
             self.draft_worker = None
             return
 
-        if self.spec_algorithm.is_async_spec():
+        if self.spec_algorithm.is_async:
             # Async spec: draft runs on a dedicated GPU in a separate process
             self._init_async_spec_worker()
             return
@@ -544,9 +544,8 @@ class Scheduler(
 
     def _init_async_spec_worker(self):
         """Initialize the async spec worker with a dedicated draft GPU process."""
-        from sglang.srt.speculative.async_spec.async_draft_runner import (
-            run_async_draft_runner_process,
-        )
+        from ssd.config import Config
+
         from sglang.srt.speculative.async_spec.async_spec_worker import (
             AsyncSpecWorker,
         )
@@ -564,30 +563,68 @@ class Scheduler(
         )
 
         ctx = mp.get_context("spawn")
-        result_pipe_r, result_pipe_w = ctx.Pipe(duplex=False)
 
+        eagle = self.spec_algorithm.is_eagle()
+        config = Config(
+            model=self.server_args.speculative_draft_model_path,  # TODO: accept revision
+            num_gpus=2,  # Total dist world size: target (rank 0) + draft (rank 1)
+            speculate=True,
+            speculate_k=self.server_args.speculative_num_steps,
+            draft_async=True,
+            fan_out_list=self.server_args.speculative_async_fan_out_list,
+            fan_out_list_miss=self.server_args.speculative_async_fan_out_list_miss,
+            gpu_memory_utilization=0.8,
+            tokenizer_path=self.server_args.tokenizer_path if eagle else None,
+            d_model_target=self.model_config.hidden_size if eagle else None,
+            draft=self.server_args.speculative_draft_model_path,  # TODO: accept revision
+            kvcache_block_size=1,
+            max_num_seqs=self.server_args.max_running_requests or 64,
+            max_model_len=self.server_args.context_length,
+            jit_speculate=self.server_args.speculative_async_jit_speculate,
+            max_steps=self.server_args.max_total_tokens,
+        )
+
+        # Spawn rank-0 companion first — DraftRunner (rank 1) needs it for
+        # dist.init_process_group handshake (collective call, both ranks must participate)
+        self.dist_companion_process = ctx.Process(
+            target=_dist_companion,
+            args=(self.gpu_id, 1223, 1),
+            daemon=True,
+        )
+        self.dist_companion_process.start()
+
+        init_q = ctx.Queue()
         self.draft_process = ctx.Process(
-            target=run_async_draft_runner_process,
-            args=(self.server_args, draft_gpu_id, async_spec_nccl_port, result_pipe_w),
+            target=_run_draft_runner,
+            args=(config, draft_gpu_id, init_q),
             daemon=True,
         )
         self.draft_process.start()
-        result_pipe_w.close()
 
         # Wait for draft runner to be ready
+        # DraftRunner/ModelRunner sends num_kvcache_blocks (int) via init_q
         logger.info("Waiting for async draft runner to initialize...")
-        draft_info = result_pipe_r.recv()
-        result_pipe_r.close()
-
-        if draft_info.get("status") != "ready":
-            error_msg = draft_info.get("error", "Unknown error")
+        result = None
+        try:
+            result = init_q.get(timeout=180)
+        except Exception:
+            alive = self.draft_process.is_alive()
+            exitcode = self.draft_process.exitcode
             raise RuntimeError(
-                f"Async draft runner failed to start: {error_msg}"
+                f"Timed out waiting for async draft runner to initialize. "
+                f"Draft process alive={alive}, exitcode={exitcode}"
             )
+        init_q.close()
+
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(
+                f"Async draft runner failed to start:\n{result['error']}"
+            )
+        num_kvcache_blocks = result
 
         logger.info(
-            f"Async draft runner ready on GPU {draft_info['draft_gpu_id']}, "
-            f"vocab_size={draft_info['vocab_size']}"
+            f"Async draft runner ready on GPU {draft_gpu_id}, "
+            f"num_kvcache_blocks={num_kvcache_blocks}"
         )
 
         # Create NCCL channel (rank=0, target side)
@@ -3054,6 +3091,47 @@ class SenderWrapper:
             output.http_worker_ipc = recv_obj.http_worker_ipc
 
         self.socket.send_pyobj(output)
+
+
+def _dist_companion(target_gpu_id, port, num_tp_gpus):
+    """Rank-0 companion that participates in torch.distributed handshake with DraftRunner.
+
+    The SSD DraftRunner requires a rank-0 partner to complete dist.init_process_group
+    and dist.new_group collective calls. This companion serves that role, then stays
+    alive so the DraftRunner's draft_loop can communicate via the async process group.
+    """
+    import threading
+
+    import torch
+    import torch.distributed as dist
+
+    torch.cuda.set_device(target_gpu_id)
+    device = torch.device(f"cuda:{target_gpu_id}")
+    dist.init_process_group(
+        "nccl",
+        f"tcp://localhost:{port}",
+        world_size=2,
+        rank=0,
+        device_id=device,
+    )
+    # tp_pg — all ranks must participate even if not in the group
+    dist.new_group(ranks=list(range(num_tp_gpus)))
+    # async_pg — blocks until DraftRunner also calls it (after model load)
+    dist.new_group(ranks=[0, 1])
+    # Stay alive — DraftRunner's draft_loop communicates with rank 0
+    threading.Event().wait()
+
+
+def _run_draft_runner(cfg, gpu_id, q):
+    """Wrapper to catch and report errors from the draft runner process."""
+    try:
+        from ssd.engine.draft_runner import DraftRunner
+
+        DraftRunner(cfg, gpu_id, q)
+    except Exception:
+        import traceback
+
+        q.put({"error": traceback.format_exc()})
 
 
 def run_scheduler_process(

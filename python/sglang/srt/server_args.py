@@ -3893,7 +3893,16 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "ASYNC_SPEC"],
+            choices=[
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "NGRAM",
+                "ASYNC_STANDALONE",
+                "ASYNC_EAGLE",
+                "ASYNC_EAGLE3",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(
