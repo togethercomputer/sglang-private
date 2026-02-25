@@ -479,7 +479,7 @@ class ServerArgs:
     speculative_async_fan_out: int = 3
     speculative_async_fan_out_list: Optional[List[int]] = None
     speculative_async_fan_out_list_miss: Optional[List[int]] = None
-    speculative_async_jit_speculate: bool = True
+    speculative_async_jit_speculate: bool = False
     speculative_async_sampler_x: Optional[float] = None
     speculative_async_draft_temperature: Optional[float] = None
 

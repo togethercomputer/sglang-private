@@ -1,4 +1,6 @@
 import logging
+import os
+from datetime import datetime
 from typing import Optional
 
 import torch
@@ -10,6 +12,41 @@ from ssd.engine.helpers.runner_helpers import (
     send_speculation_request,
     receive_speculation_response,
 )
+
+NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
+_nccl_tokenizer = None
+
+def _ts():
+    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+def _get_nccl_tokenizer():
+    global _nccl_tokenizer
+    if _nccl_tokenizer is None:
+        try:
+            from transformers import AutoTokenizer
+            _nccl_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        except Exception as e:
+            print(f"[{_ts()}] [NCCL_LOG] Failed to load tokenizer: {e}", flush=True)
+            return None
+    return _nccl_tokenizer
+
+def _decode_ids(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return "<no tokenizer>"
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return tok.decode(ids)
+
+def _decode_id_list(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return []
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return [tok.decode([t]) for t in ids]
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -158,6 +195,17 @@ class AsyncSpecWorker(SpecWorker):
             eagle_acts.shape[1] if eagle_acts is not None else 0,
             self.device,
         )
+        if NCCL_LOG:
+            sep = '=' * 80
+            print(f"[{_ts()}] \n{sep}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] batch_size={forward_batch.batch_size}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] input_ids shape={forward_batch.input_ids.shape}, values={forward_batch.input_ids.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] input_ids decoded='{_decode_ids(forward_batch.input_ids)}'", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] extend_seq_lens={forward_batch.extend_seq_lens.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] metadata={metadata.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] req_pool_indices={forward_batch.req_pool_indices.tolist()}", flush=True)
+            print(f"[{_ts()}] {sep}\n", flush=True)
         send_prefill_request(
             cmd,
             metadata,
@@ -173,7 +221,7 @@ class AsyncSpecWorker(SpecWorker):
     # Decode forward pass for async spec worker (runs on separate process).
     def _draft_forward(self, forward_batch: ForwardBatch, request_ids: torch.tensor = None):
         assert request_ids is not None
-        print(f'[draft_forward] SENDING SPECULATION REQUEST', flush=True)
+        print(f'[{_ts()}] [draft_forward] SENDING SPECULATION REQUEST', flush=True)
         B = forward_batch.batch_size
         if B != self._hs_B:
             self._alloc_handshake_bufs(B)
@@ -187,18 +235,33 @@ class AsyncSpecWorker(SpecWorker):
         self._num_tokens_buf = forward_batch.seq_lens
         # self._temps_buf = forward_batch.spec_info.temperature
         # self._block_tables_buf = forward_batch.spec_info.draft_block_table
+        draft_block_table = _get_draft_block_table(forward_batch, self.device)
+        if NCCL_LOG:
+            sep = '=' * 80
+            print(f"[{_ts()}] \n{sep}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] B={B}, K={self.speculative_num_steps}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] request_ids={request_ids.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] accept_length={accept_length if isinstance(accept_length, int) else accept_length.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] verified_id={forward_batch.spec_info.verified_id.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] verified_id decoded={_decode_id_list(forward_batch.spec_info.verified_id)}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] cache_keys shape={self._cache_keys.shape}, values={self._cache_keys.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] seq_lens={forward_batch.seq_lens.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] temps={self._temps_buf.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] meta={self._meta.tolist()}", flush=True)
+            print(f"[{_ts()}] {sep}\n", flush=True)
         send_speculation_request(
             self._cmd,
             self._meta,
             self._cache_keys,
             self._num_tokens_buf,
-            _get_draft_block_table(forward_batch, self.device),
+            draft_block_table,
             self._temps_buf,
             self.async_process_group,
             self.async_rank,
         )
-        print(f'[draft_forward] SPECULATION REQUEST SENT', flush=True)
-        print(f'[draft_forward] RECEIVING SPECULATION RESPONSE', flush=True)
+        print(f'[{_ts()}] [draft_forward] SPECULATION REQUEST SENT', flush=True)
+        print(f'[{_ts()}] [draft_forward] RECEIVING SPECULATION RESPONSE', flush=True)
         speculations, _, _ = receive_speculation_response(
             B,
             self.speculative_num_steps,
@@ -208,7 +271,17 @@ class AsyncSpecWorker(SpecWorker):
             self.async_rank,
             skip_logits=True
         )
-        print(f'[draft_forward] SPECULATION RESPONE RECEIVED', flush=True)
+        print(f'[{_ts()}] [draft_forward] SPECULATION RESPONE RECEIVED', flush=True)
+        if NCCL_LOG:
+            sep = '=' * 80
+            print(f"[{_ts()}] \n{sep}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC_RESP] speculations shape={speculations.shape}", flush=True)
+            for i in range(B):
+                spec_ids = speculations[i].tolist()
+                spec_text = _decode_id_list(speculations[i])
+                print(f"[{_ts()}]   req[{i}]: speculations={spec_ids}", flush=True)
+                print(f"[{_ts()}]            decoded={spec_text}", flush=True)
+            print(f"[{_ts()}] {sep}\n", flush=True)
         return self._parent_list, self._top_scores_index, speculations
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):

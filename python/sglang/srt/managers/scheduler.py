@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+from datetime import datetime
 import signal
 import sys
 import time
@@ -213,6 +214,11 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+def _ts():
+    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -566,8 +572,8 @@ class Scheduler(
 
         eagle = self.spec_algorithm.is_eagle()
         kv_cache_size = self.tp_worker.model_runner.token_to_kv_pool.size
-        print(f"token_to_kv_pool.size={kv_cache_size}")
-        print(f"req_to_token_pool.max_context_len={self.tp_worker.model_runner.req_to_token_pool.max_context_len}")
+        print(f"[{_ts()}] token_to_kv_pool.size={kv_cache_size}")
+        print(f"[{_ts()}] req_to_token_pool.max_context_len={self.tp_worker.model_runner.req_to_token_pool.max_context_len}")
 
         config = Config(
             model=self.server_args.speculative_draft_model_path,  # TODO: accept revision
@@ -588,15 +594,15 @@ class Scheduler(
             jit_speculate=self.server_args.speculative_async_jit_speculate,
             max_steps=self.server_args.max_total_tokens,
             async_nccl_port=async_spec_nccl_port,
-            # TODO: Delete this, it's just for debugging
-            verbose=True,
+            # Currently always do greedy drafting in async spec, no need for draft to return logits.
+            skip_return_logits=True,
+            verbose=True,  # TODO: Delete this, it's just for debugging
         )
 
-        # BANANA
         init_q = ctx.Queue()
         self.draft_process = ctx.Process(
             target=_run_draft_runner,
-            args=(config, draft_gpu_id, init_q, kv_cache_size),
+            args=(config, draft_gpu_id, init_q),
             daemon=True,
         )
         self.draft_process.start()
@@ -645,6 +651,11 @@ class Scheduler(
             f"Async draft runner ready on GPU {draft_gpu_id}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
         )
+        if num_kvcache_blocks != kv_cache_size:
+            logger.warning(
+                f"Target process has KV cache of size {kv_cache_size} blocks, "
+                f"but draft process has {num_kvcache_blocks} blocks"
+            )
 
         # Create AsyncSpecWorker
         self.draft_worker = AsyncSpecWorker(
