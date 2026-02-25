@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -73,6 +74,10 @@ if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+def hash_to_int64(s: str) -> int:
+    return int.from_bytes(hashlib.md5(s.encode()).digest()[:8], 'little', signed=True)
 
 
 class SpecWorker(TpModelWorker):
@@ -295,9 +300,12 @@ class SpecWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            print(f'[forward_batch_generation] FORWARD TARGET EXTEND STARTING', flush=True)
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
             )
+            print(f'[forward_batch_generation] FORWARD TARGET EXTEND DONE', flush=True)
+            print(f'[forward_batch_generation] FORWARD DRAFT EXTEND STARTING', flush=True)
             contexts = self._get_context_managers_for_draft()
             with contexts[0], contexts[1], contexts[2]:
                 self.forward_draft_extend(
@@ -307,6 +315,8 @@ class SpecWorker(TpModelWorker):
                     seq_lens_cpu,
                     logits_output.mm_input_embeds,
                 )
+            print(f'[forward_batch_generation] FORWARD DRAFT EXTEND DONE', flush=True)
+            print(f"{next_token_ids.shape=}, {next_token_ids=}", flush=True)
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -315,11 +325,27 @@ class SpecWorker(TpModelWorker):
             )
         else:
             contexts = self._get_context_managers_for_draft()
+
+            print(f'[forward_batch_generation] DRAFT STARTING', flush=True)
+
+            ### DRAFT ###
             with contexts[0], contexts[1], contexts[2]:
                 spec_info = self.draft(batch)
+            #############
+
+            print(f'[forward_batch_generation] DRAFT DONE', flush=True)
+            print(f"{spec_info.draft_token.shape=}, {spec_info.draft_token=}", flush=True)
+            print(f'[forward_batch_generation] VERIFY STARTING', flush=True)
+
+            ### VERIFY ###
             logits_output, verify_output, _, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+            #############
+            print(f'[forward_batch_generation] VERIFY DONE', flush=True)
+            print(f"{logits_output.hidden_states.shape=}, {logits_output.hidden_states=}", flush=True)
+            print(f"{verify_output.verified_id.shape=}, {verify_output.verified_id=}", flush=True)
+            print(f"{can_run_cuda_graph=}", flush=True)
 
             contexts = self._get_context_managers_for_draft()
             with contexts[0], contexts[1], contexts[2]:
@@ -582,8 +608,13 @@ class SpecWorker(TpModelWorker):
                 if self.draft_attn_backend is not None:
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
+            request_ids = torch.tensor(
+                [hash_to_int64(req.rid) for req in batch.reqs],
+                dtype=torch.int64,
+                device=self.device,
+            )
             parent_list, top_scores_index, draft_tokens = self._draft_forward(
-                forward_batch
+                forward_batch, request_ids=request_ids,
             )
 
         if batch.forward_mode.is_idle():
@@ -628,7 +659,8 @@ class SpecWorker(TpModelWorker):
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
-    def _draft_forward(self, forward_batch: ForwardBatch):
+    def _draft_forward(self, forward_batch: ForwardBatch, request_ids: torch.tensor = None):
+        del request_ids  # unused in base SpecWorker class.
         # Parse args
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)

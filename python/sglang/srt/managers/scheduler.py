@@ -549,10 +549,10 @@ class Scheduler(
         from sglang.srt.speculative.async_spec.async_spec_worker import (
             AsyncSpecWorker,
         )
-        from sglang.srt.speculative.async_spec.nccl_comm import create_nccl_channel
-        from sglang.srt.utils.common import get_open_port
+        from sglang.srt.utils.common import get_open_port, init_custom_process_group
 
         import torch.multiprocessing as mp
+        from torch.distributed import TCPStore
 
         draft_gpu_id = self.server_args.tp_size
         async_spec_nccl_port = get_open_port()
@@ -565,6 +565,10 @@ class Scheduler(
         ctx = mp.get_context("spawn")
 
         eagle = self.spec_algorithm.is_eagle()
+        kv_cache_size = self.tp_worker.model_runner.token_to_kv_pool.size
+        print(f"token_to_kv_pool.size={kv_cache_size}")
+        print(f"req_to_token_pool.max_context_len={self.tp_worker.model_runner.req_to_token_pool.max_context_len}")
+
         config = Config(
             model=self.server_args.speculative_draft_model_path,  # TODO: accept revision
             num_gpus=2,  # Total dist world size: target (rank 0) + draft (rank 1)
@@ -578,28 +582,43 @@ class Scheduler(
             d_model_target=self.model_config.hidden_size if eagle else None,
             draft=self.server_args.speculative_draft_model_path,  # TODO: accept revision
             kvcache_block_size=1,
+            num_kvcache_blocks=kv_cache_size,
             max_num_seqs=self.server_args.max_running_requests or 64,
             max_model_len=self.server_args.context_length,
             jit_speculate=self.server_args.speculative_async_jit_speculate,
             max_steps=self.server_args.max_total_tokens,
+            async_nccl_port=async_spec_nccl_port,
+            # TODO: Delete this, it's just for debugging
+            verbose=True,
         )
 
-        # Spawn rank-0 companion first — DraftRunner (rank 1) needs it for
-        # dist.init_process_group handshake (collective call, both ranks must participate)
-        self.dist_companion_process = ctx.Process(
-            target=_dist_companion,
-            args=(self.gpu_id, 1223, 1),
-            daemon=True,
-        )
-        self.dist_companion_process.start()
-
+        # BANANA
         init_q = ctx.Queue()
         self.draft_process = ctx.Process(
             target=_run_draft_runner,
-            args=(config, draft_gpu_id, init_q),
+            args=(config, draft_gpu_id, init_q, kv_cache_size),
             daemon=True,
         )
         self.draft_process.start()
+
+        # Create custom process group (rank=0, target side).
+        # This blocks until the DraftRunner (rank=1) also calls
+        # init_custom_process_group during its model load.
+        device = torch.device(f"cuda:{self.gpu_id}")
+        store = TCPStore(
+            host_name="127.0.0.1",
+            port=async_spec_nccl_port,
+            world_size=2,
+            is_master=True,
+        )
+        with torch.cuda.device(device):
+            async_pg = init_custom_process_group(
+                backend="nccl",
+                store=store,
+                world_size=2,
+                rank=0,
+                group_name="async_spec",
+            )
 
         # Wait for draft runner to be ready
         # DraftRunner/ModelRunner sends num_kvcache_blocks (int) via init_q
@@ -627,16 +646,6 @@ class Scheduler(
             f"num_kvcache_blocks={num_kvcache_blocks}"
         )
 
-        # Create NCCL channel (rank=0, target side)
-        nccl_channel = create_nccl_channel(
-            rank=0,
-            device=torch.device(f"cuda:{self.gpu_id}"),
-            nccl_port=async_spec_nccl_port,
-            max_batch_size=self.server_args.max_running_requests or 64,
-            max_spec_k=self.server_args.speculative_num_steps,
-            max_prefill_tokens=self.server_args.max_prefill_tokens or 16384,
-        )
-
         # Create AsyncSpecWorker
         self.draft_worker = AsyncSpecWorker(
             server_args=self.server_args,
@@ -646,7 +655,10 @@ class Scheduler(
             moe_ep_rank=self.moe_ep_rank,
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
-            nccl_channel=nccl_channel,
+            async_process_group=async_pg,
+            # For this custom process group, rank 1 is the draft runner, rank 0 is the target.
+            # These ranks are independent of the TP ranks / GPU ids.
+            async_rank=1,
         )
 
     def init_model_worker(self):
@@ -3092,34 +3104,6 @@ class SenderWrapper:
 
         self.socket.send_pyobj(output)
 
-
-def _dist_companion(target_gpu_id, port, num_tp_gpus):
-    """Rank-0 companion that participates in torch.distributed handshake with DraftRunner.
-
-    The SSD DraftRunner requires a rank-0 partner to complete dist.init_process_group
-    and dist.new_group collective calls. This companion serves that role, then stays
-    alive so the DraftRunner's draft_loop can communicate via the async process group.
-    """
-    import threading
-
-    import torch
-    import torch.distributed as dist
-
-    torch.cuda.set_device(target_gpu_id)
-    device = torch.device(f"cuda:{target_gpu_id}")
-    dist.init_process_group(
-        "nccl",
-        f"tcp://localhost:{port}",
-        world_size=2,
-        rank=0,
-        device_id=device,
-    )
-    # tp_pg — all ranks must participate even if not in the group
-    dist.new_group(ranks=list(range(num_tp_gpus)))
-    # async_pg — blocks until DraftRunner also calls it (after model load)
-    dist.new_group(ranks=[0, 1])
-    # Stay alive — DraftRunner's draft_loop communicates with rank 0
-    threading.Event().wait()
 
 
 def _run_draft_runner(cfg, gpu_id, q):
