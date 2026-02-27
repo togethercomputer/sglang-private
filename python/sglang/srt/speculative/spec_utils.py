@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import logging
 import os
 import time
@@ -26,6 +27,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_nccl_tokenizer = None
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -48,6 +50,42 @@ SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+
+
+def _ts():
+    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+
+def _get_nccl_tokenizer():
+    global _nccl_tokenizer
+    if _nccl_tokenizer is None:
+        try:
+            from transformers import AutoTokenizer
+            _nccl_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        except Exception as e:
+            print(f"[{_ts()}] [NCCL_LOG] Failed to load tokenizer: {e}", flush=True)
+            return None
+    return _nccl_tokenizer
+
+
+def _decode_ids(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return "<no tokenizer>"
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return tok.decode(ids)
+
+
+def _decode_id_list(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return []
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return [tok.decode([t]) for t in ids]
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:

@@ -1,6 +1,5 @@
 import logging
 import os
-from datetime import datetime
 from typing import Optional
 
 import torch
@@ -13,64 +12,20 @@ from ssd.engine.helpers.runner_helpers import (
     receive_speculation_response,
 )
 
-NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
-_nccl_tokenizer = None
-
-def _ts():
-    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
-
-def _get_nccl_tokenizer():
-    global _nccl_tokenizer
-    if _nccl_tokenizer is None:
-        try:
-            from transformers import AutoTokenizer
-            _nccl_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-        except Exception as e:
-            print(f"[{_ts()}] [NCCL_LOG] Failed to load tokenizer: {e}", flush=True)
-            return None
-    return _nccl_tokenizer
-
-def _decode_ids(ids_tensor):
-    tok = _get_nccl_tokenizer()
-    if tok is None:
-        return "<no tokenizer>"
-    ids = ids_tensor.cpu().tolist()
-    if isinstance(ids, int):
-        ids = [ids]
-    return tok.decode(ids)
-
-def _decode_id_list(ids_tensor):
-    tok = _get_nccl_tokenizer()
-    if tok is None:
-        return []
-    ids = ids_tensor.cpu().tolist()
-    if isinstance(ids, int):
-        ids = [ids]
-    return [tok.decode([t]) for t in ids]
-
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_worker import SpecWorker
+from sglang.srt.speculative.spec_utils import _ts, _decode_ids, _decode_id_list
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import LogitsProcessorOutput
 from sglang.srt.utils import empty_context, set_random_seed
 
 logger = logging.getLogger(__name__)
+NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 
-
-def _get_draft_block_table(
-    forward_batch: ForwardBatch,
-    device: torch.device,
-) -> torch.tensor:
-    r2t = forward_batch.req_to_token_pool.req_to_token
-    draft_block_table = torch.stack(
-        [r2t[idx, :] for idx in forward_batch.req_pool_indices],
-        dim=0,
-    ).to(device=device, dtype=torch.int64)
-    return draft_block_table
 
 class ModelConfigStub:
     def __init__(self, context_len: int, vocab_size: int, dtype: torch.dtype):
@@ -123,15 +78,23 @@ class AsyncSpecWorker(SpecWorker):
         self.async_process_group = async_process_group
         self.async_rank = async_rank
         self.draft_attn_backend = None
-        self.num_tokens_for_async_draft_tree = sum(self.server_args.speculative_async_fan_out_list)
+        K = self.speculative_num_steps
+        MQ_LEN = sum(self.server_args.speculative_async_fan_out_list)
+        # K from the glue decode, MQ_LEN * K from the tree decode.
+        self.num_tokens_for_async_draft_tree = K * (MQ_LEN + 1)
         self._alloc_handshake_bufs(1)
 
-    def _alloc_handshake_bufs(self, B):
+    def _alloc_handshake_bufs(self, B, max_blocks: int = -1):
         self._hs_B = B
         K = self.speculative_num_steps
         d = self.device
         self._cmd = torch.zeros(1, dtype=torch.int64, device=d)
-        self._meta = torch.tensor([B, K, self.server_args.speculative_async_fan_out], dtype=torch.int64, device=d)
+        self._meta = torch.tensor([
+            B,
+            K,
+            self.server_args.speculative_async_fan_out,
+            max_blocks,
+        ], dtype=torch.int64, device=d)
         self._cache_keys = torch.empty(B, 3, dtype=torch.int64, device=d)
         self._num_tokens_buf = torch.empty(B, dtype=torch.int64, device=d)
         self._temps_buf = torch.zeros(B, dtype=torch.int64, device=d)
@@ -147,6 +110,20 @@ class AsyncSpecWorker(SpecWorker):
             0, K, dtype=torch.int64, device=d,
         ).unsqueeze(0).repeat(B, 1)
 
+    def _get_draft_block_table(
+        self,
+        forward_batch: ForwardBatch,
+    ) -> torch.tensor:
+        r2t = forward_batch.req_to_token_pool.req_to_token
+        max_blocks = min(
+            forward_batch.seq_lens.max() + self.num_tokens_for_async_draft_tree,
+            forward_batch.req_to_token_pool.req_to_token.shape[1],
+        )
+        draft_block_table = torch.stack(
+            [r2t[idx, :max_blocks] for idx in forward_batch.req_pool_indices],
+            dim=0,
+        ).to(device=self.device, dtype=torch.int64)
+        return draft_block_table, max_blocks
 
     def _init_model_runner(self):
         self._model_runner = ModelRunnerStub(
@@ -184,13 +161,15 @@ class AsyncSpecWorker(SpecWorker):
 
     # Prefill forward pass for async spec worker.
     def _draft_extend_forward_pass(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        draft_block_table = _get_draft_block_table(forward_batch, self.device)
+        draft_block_table, max_blocks = self._get_draft_block_table(forward_batch)
         cmd = torch.tensor([1], dtype=torch.int64, device=self.device)
         eagle_acts = forward_batch.spec_info.hidden_states if self.speculative_algorithm.is_eagle() else None
+        print(f'[{_ts()}] [draft_extend_forward_pass] max_blocks={max_blocks}', flush=True)
+        print(f'[{_ts()}] [draft_extend_forward_pass] input_ids.shape={forward_batch.input_ids.shape}', flush=True)
         metadata = prepare_prefill_metadata(
             forward_batch.input_ids.shape[0],
             forward_batch.batch_size,
-            draft_block_table.shape[1],
+            max_blocks,
             eagle_acts is not None,
             eagle_acts.shape[1] if eagle_acts is not None else 0,
             self.device,
@@ -223,19 +202,21 @@ class AsyncSpecWorker(SpecWorker):
         assert request_ids is not None
         print(f'[{_ts()}] [draft_forward] SENDING SPECULATION REQUEST', flush=True)
         B = forward_batch.batch_size
+        draft_block_table, max_blocks = self._get_draft_block_table(forward_batch)
         if B != self._hs_B:
-            self._alloc_handshake_bufs(B)
+            self._alloc_handshake_bufs(B, max_blocks)
+        else:
+            self._meta[3] = max_blocks
 
         accept_length = forward_batch.spec_info.accept_length
         if accept_length is None:
             accept_length = 0  # first decode, no prior acceptance
         self._cache_keys[:, 0] = request_ids
-        self._cache_keys[:, 1] = accept_length - 1
+        self._cache_keys[:, 1] = accept_length
         self._cache_keys[:, 2] = forward_batch.spec_info.verified_id
         self._num_tokens_buf = forward_batch.seq_lens
         # self._temps_buf = forward_batch.spec_info.temperature
         # self._block_tables_buf = forward_batch.spec_info.draft_block_table
-        draft_block_table = _get_draft_block_table(forward_batch, self.device)
         if NCCL_LOG:
             sep = '=' * 80
             print(f"[{_ts()}] \n{sep}", flush=True)
