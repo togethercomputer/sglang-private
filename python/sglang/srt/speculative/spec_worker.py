@@ -550,6 +550,7 @@ class SpecWorker(TpModelWorker):
             self.page_size,
             next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps + self.page_size),
+            self._get_alloc_len_per_decode(),
         )
 
         if self.page_size > 1 and self.topk > 1:
@@ -1027,7 +1028,7 @@ class SpecWorker(TpModelWorker):
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            self.capture_for_decode(logits_output, forward_batch.spec_info)
+            self._capture_for_decode(logits_output, forward_batch.spec_info)
 
         if self.enable_nan_detection:
             detect_nan(logits_output)

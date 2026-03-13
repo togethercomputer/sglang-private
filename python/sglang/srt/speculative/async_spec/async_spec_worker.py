@@ -154,7 +154,7 @@ class AsyncSpecWorker(SpecWorker):
     def _capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        return None
+        pass
 
     def _prepare_for_extend(self, batch: ScheduleBatch):
         pass
@@ -266,4 +266,7 @@ class AsyncSpecWorker(SpecWorker):
         return self._parent_list, self._top_scores_index, speculations
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        pass
+        batch.spec_info.prepare_extend_after_decode(
+            batch,
+            self.speculative_num_steps,
+        )

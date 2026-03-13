@@ -194,16 +194,19 @@ def assign_draft_cache_locs(
     page_size: tl.constexpr,
     bs_upper: tl.constexpr,
     iter_upper: tl.constexpr,
+    copy_len: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
 
     if page_size == 1 or topk == 1:
-        copy_len = topk * speculative_num_steps
+        if copy_len > 0:
+            copy_len = topk * speculative_num_steps
         out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
     else:
         bs_offset = tl.arange(0, bs_upper)
-        copy_len = tl.load(extend_lens + pid)
+        if copy_len > 0:
+            copy_len = tl.load(extend_lens + pid)
         cum_copy_len = tl.sum(tl.load(extend_lens + bs_offset, mask=bs_offset < pid))
         out_cache_ptr = out_cache_loc + cum_copy_len
 
