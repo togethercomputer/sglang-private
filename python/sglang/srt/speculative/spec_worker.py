@@ -416,7 +416,7 @@ class SpecWorker(TpModelWorker):
             model_worker_batch.seq_lens_cpu,
         )
 
-    def _get_alloc_len_per_decode(self) -> int:
+    def _get_alloc_len_for_speculation(self) -> int:
         # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
         return self.speculative_num_steps * self.topk
 
@@ -550,7 +550,7 @@ class SpecWorker(TpModelWorker):
             self.page_size,
             next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps + self.page_size),
-            self._get_alloc_len_per_decode(),
+            self._get_alloc_len_for_speculation(),
         )
 
         if self.page_size > 1 and self.topk > 1:

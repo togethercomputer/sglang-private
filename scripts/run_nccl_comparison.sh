@@ -51,6 +51,7 @@ echo "SGLang server will start (no warmup), then we send a request with max_new_
     source /work/avner/git/sglang-private-main/.venv/bin/activate
     export CUDA_VISIBLE_DEVICES="$SGLANG_GPUS"
     export SSD_NCCL_LOG=1
+    export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
 
     SGLANG_PORT=30000
 

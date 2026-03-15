@@ -210,11 +210,11 @@ class AsyncSpecWorker(SpecWorker):
 
         accept_length = forward_batch.spec_info.accept_length
         if accept_length is None:
-            accept_length = 0  # first decode, no prior acceptance
+            accept_length = -2  # first decode, no prior acceptance
         self._cache_keys[:, 0] = request_ids
         self._cache_keys[:, 1] = accept_length
         self._cache_keys[:, 2] = forward_batch.spec_info.verified_id
-        self._num_tokens_buf = forward_batch.seq_lens
+        self._num_tokens_buf = forward_batch.seq_lens + 1
         # self._temps_buf = forward_batch.spec_info.temperature
         # self._block_tables_buf = forward_batch.spec_info.draft_block_table
         if NCCL_LOG:
@@ -226,7 +226,7 @@ class AsyncSpecWorker(SpecWorker):
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] verified_id={forward_batch.spec_info.verified_id.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] verified_id decoded={_decode_id_list(forward_batch.spec_info.verified_id)}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] cache_keys shape={self._cache_keys.shape}, values={self._cache_keys.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] seq_lens={forward_batch.seq_lens.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] num_tokens (seq_lens+1)={self._num_tokens_buf.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] temps={self._temps_buf.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] meta={self._meta.tolist()}", flush=True)

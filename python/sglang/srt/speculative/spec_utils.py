@@ -200,13 +200,13 @@ def assign_draft_cache_locs(
     pid = tl.program_id(axis=0)
 
     if page_size == 1 or topk == 1:
-        if copy_len > 0:
-            copy_len = topk * speculative_num_steps
-        out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
+        # copy_len is passed by the caller (_get_alloc_len_for_speculation).
+        # For async spec this is num_tokens_for_async_draft_tree; otherwise
+        # it equals topk * speculative_num_steps.
+        out_cache_ptr = out_cache_loc + pid * copy_len
     else:
         bs_offset = tl.arange(0, bs_upper)
-        if copy_len > 0:
-            copy_len = tl.load(extend_lens + pid)
+        copy_len = tl.load(extend_lens + pid)
         cum_copy_len = tl.sum(tl.load(extend_lens + bs_offset, mask=bs_offset < pid))
         out_cache_ptr = out_cache_loc + cum_copy_len
 
