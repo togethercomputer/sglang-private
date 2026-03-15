@@ -81,7 +81,7 @@ class AsyncSpecWorker(SpecWorker):
         K = self.speculative_num_steps
         MQ_LEN = sum(self.server_args.speculative_async_fan_out_list)
         # K from the glue decode, MQ_LEN * K from the tree decode.
-        self.num_tokens_for_async_draft_tree = K * (MQ_LEN + 1)
+        self.num_tokens_for_async_draft_tree = K * (MQ_LEN + 1) + 1
         self._alloc_handshake_bufs(1)
 
     def _alloc_handshake_bufs(self, B, max_blocks: int = -1):
