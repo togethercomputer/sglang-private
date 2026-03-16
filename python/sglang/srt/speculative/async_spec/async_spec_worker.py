@@ -22,9 +22,13 @@ from sglang.srt.speculative.spec_utils import _ts, _decode_ids, _decode_id_list
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import LogitsProcessorOutput
 from sglang.srt.utils import empty_context, set_random_seed
+from sglang.srt.distributed import get_tp_group
 
 logger = logging.getLogger(__name__)
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
+_SGLANG_PROF = os.environ.get('SSD_PROFILE', '0') == '1'
+import time as _time
+
 
 
 class ModelConfigStub:
@@ -77,6 +81,7 @@ class AsyncSpecWorker(SpecWorker):
         super().__init__(server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker)
         self.async_process_group = async_process_group
         self.async_rank = async_rank
+        self._is_async_leader = (async_process_group is not None)
         self.draft_attn_backend = None
         K = self.speculative_num_steps
         MQ_LEN = sum(self.server_args.speculative_async_fan_out_list)
@@ -186,16 +191,17 @@ class AsyncSpecWorker(SpecWorker):
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] metadata={metadata.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] req_pool_indices={forward_batch.req_pool_indices.tolist()}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
-        send_prefill_request(
-            cmd,
-            metadata,
-            forward_batch.input_ids,
-            forward_batch.extend_seq_lens,
-            draft_block_table,
-            eagle_acts,
-            self.async_process_group,
-            self.async_rank,
-        )
+        if self._is_async_leader:
+            send_prefill_request(
+                cmd,
+                metadata,
+                forward_batch.input_ids,
+                forward_batch.extend_seq_lens,
+                draft_block_table,
+                eagle_acts,
+                self.async_process_group,
+                self.async_rank,
+            )
         return LogitsProcessorOutput(None, None)
 
     # Decode forward pass for async spec worker (runs on separate process).
@@ -238,28 +244,46 @@ class AsyncSpecWorker(SpecWorker):
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] temps={self._temps_buf.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] meta={self._meta.tolist()}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
-        send_speculation_request(
-            self._cmd,
-            self._meta,
-            self._cache_keys,
-            self._num_tokens_buf,
-            draft_block_table,
-            self._temps_buf,
-            self.async_process_group,
-            self.async_rank,
-        )
-        if NCCL_LOG:
-            print(f'[{_ts()}] [draft_forward] SPECULATION REQUEST SENT', flush=True)
-            print(f'[{_ts()}] [draft_forward] RECEIVING SPECULATION RESPONSE', flush=True)
-        speculations, _, _ = receive_speculation_response(
-            B,
-            self.speculative_num_steps,
-            self._fused_response,
-            self._logits_q,
-            self.async_process_group,
-            self.async_rank,
-            skip_logits=True
-        )
+        if self._is_async_leader:
+            if _SGLANG_PROF:
+                torch.cuda.synchronize()
+                _df_t0 = _time.perf_counter()
+            send_speculation_request(
+                self._cmd,
+                self._meta,
+                self._cache_keys,
+                self._num_tokens_buf,
+                draft_block_table,
+                self._temps_buf,
+                self.async_process_group,
+                self.async_rank,
+            )
+            if _SGLANG_PROF:
+                torch.cuda.synchronize()
+                _df_t1 = _time.perf_counter()
+            if NCCL_LOG:
+                print(f'[{_ts()}] [draft_forward] SPECULATION REQUEST SENT', flush=True)
+                print(f'[{_ts()}] [draft_forward] RECEIVING SPECULATION RESPONSE', flush=True)
+            speculations, _, _ = receive_speculation_response(
+                B,
+                self.speculative_num_steps,
+                self._fused_response,
+                self._logits_q,
+                self.async_process_group,
+                self.async_rank,
+                skip_logits=True
+            )
+            if _SGLANG_PROF:
+                torch.cuda.synchronize()
+                _df_t2 = _time.perf_counter()
+                print(f"[PROFILE sglang_draft] nccl_send={(_df_t1-_df_t0)*1000:.2f}ms nccl_recv={(_df_t2-_df_t1)*1000:.2f}ms total={(_df_t2-_df_t0)*1000:.2f}ms", flush=True)
+        else:
+            speculations = torch.empty(B, self.speculative_num_steps, dtype=torch.int64, device=self.device)
+
+        # Broadcast speculations from TP rank 0 to all other TP ranks
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1:
+            dist.broadcast(speculations, src=tp_group.ranks[0], group=tp_group.device_group)
         if NCCL_LOG:
             print(f'[{_ts()}] [draft_forward] SPECULATION RESPONE RECEIVED', flush=True)
             sep = '=' * 80

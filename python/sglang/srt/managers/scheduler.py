@@ -605,65 +605,70 @@ class Scheduler(
             skip_return_logits=True,
         )
 
-        init_q = ctx.Queue()
-        self.draft_process = ctx.Process(
-            target=_run_draft_runner,
-            args=(config, draft_gpu_id, init_q),
-            daemon=True,
-        )
-        self.draft_process.start()
+        async_pg = None
+        if self.tp_rank == 0:
+            init_q = ctx.Queue()
+            self.draft_process = ctx.Process(
+                target=_run_draft_runner,
+                args=(config, draft_gpu_id, init_q),
+                daemon=True,
+            )
+            self.draft_process.start()
 
-        # Create custom process group (rank=0, target side).
-        # This blocks until the DraftRunner (rank=1) also calls
-        # init_custom_process_group during its model load.
-        device = torch.device(f"cuda:{self.gpu_id}")
-        store = TCPStore(
-            host_name="127.0.0.1",
-            port=async_spec_nccl_port,
-            world_size=2,
-            is_master=True,
-        )
-        with torch.cuda.device(device):
-            async_pg = init_custom_process_group(
-                backend="nccl",
-                store=store,
+            # Create custom process group (rank=0, target side).
+            # This blocks until the DraftRunner (rank=1) also calls
+            # init_custom_process_group during its model load.
+            device = torch.device(f"cuda:{self.gpu_id}")
+            store = TCPStore(
+                host_name="127.0.0.1",
+                port=async_spec_nccl_port,
                 world_size=2,
-                rank=0,
-                group_name="async_spec",
+                is_master=True,
             )
+            with torch.cuda.device(device):
+                async_pg = init_custom_process_group(
+                    backend="nccl",
+                    store=store,
+                    world_size=2,
+                    rank=0,
+                    group_name="async_spec",
+                )
 
-        # Wait for draft runner to be ready
-        # DraftRunner/ModelRunner sends num_kvcache_blocks (int) via init_q
-        logger.info("Waiting for async draft runner to initialize...")
-        result = None
-        try:
-            result = init_q.get(timeout=180)
-        except Exception:
-            alive = self.draft_process.is_alive()
-            exitcode = self.draft_process.exitcode
-            raise RuntimeError(
-                f"Timed out waiting for async draft runner to initialize. "
-                f"Draft process alive={alive}, exitcode={exitcode}"
+            # Wait for draft runner to be ready
+            # DraftRunner/ModelRunner sends num_kvcache_blocks (int) via init_q
+            logger.info("Waiting for async draft runner to initialize...")
+            result = None
+            try:
+                result = init_q.get(timeout=180)
+            except Exception:
+                alive = self.draft_process.is_alive()
+                exitcode = self.draft_process.exitcode
+                raise RuntimeError(
+                    f"Timed out waiting for async draft runner to initialize. "
+                    f"Draft process alive={alive}, exitcode={exitcode}"
+                )
+            init_q.close()
+
+            if isinstance(result, dict) and "error" in result:
+                raise RuntimeError(
+                    f"Async draft runner failed to start:\n{result['error']}"
+                )
+            num_kvcache_blocks = result
+
+            logger.info(
+                f"Async draft runner ready on GPU {draft_gpu_id}, "
+                f"num_kvcache_blocks={num_kvcache_blocks}"
             )
-        init_q.close()
+            if num_kvcache_blocks != kv_cache_size:
+                logger.warning(
+                    f"Target process has KV cache of size {kv_cache_size} blocks, "
+                    f"but draft process has {num_kvcache_blocks} blocks"
+                )
+        else:
+            logger.info(f"TP rank {self.tp_rank}: skipping draft runner spawn (handled by rank 0)")
 
-        if isinstance(result, dict) and "error" in result:
-            raise RuntimeError(
-                f"Async draft runner failed to start:\n{result['error']}"
-            )
-        num_kvcache_blocks = result
-
-        logger.info(
-            f"Async draft runner ready on GPU {draft_gpu_id}, "
-            f"num_kvcache_blocks={num_kvcache_blocks}"
-        )
-        if num_kvcache_blocks != kv_cache_size:
-            logger.warning(
-                f"Target process has KV cache of size {kv_cache_size} blocks, "
-                f"but draft process has {num_kvcache_blocks} blocks"
-            )
-
-        # Create AsyncSpecWorker
+        # Create AsyncSpecWorker on all ranks.
+        # Only rank 0 has async_pg != None; other ranks will broadcast from rank 0.
         self.draft_worker = AsyncSpecWorker(
             server_args=self.server_args,
             gpu_id=self.gpu_id,

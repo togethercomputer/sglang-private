@@ -76,6 +76,8 @@ if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
 logger = logging.getLogger(__name__)
+_SGLANG_PROF = os.environ.get('SSD_PROFILE', '0') == '1'
+
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 
 
@@ -337,6 +339,10 @@ class SpecWorker(TpModelWorker):
         else:
             contexts = self._get_context_managers_for_draft()
 
+            if _SGLANG_PROF:
+                torch.cuda.synchronize()
+                _fbg_t0 = time.perf_counter()
+
             if NCCL_LOG:
                 print(f'[{_ts()}] [forward_batch_generation] DRAFT STARTING', flush=True)
 
@@ -344,6 +350,10 @@ class SpecWorker(TpModelWorker):
             with contexts[0], contexts[1], contexts[2]:
                 spec_info = self.draft(batch)
             #############
+
+            if _SGLANG_PROF:
+                torch.cuda.synchronize()
+                _fbg_t1 = time.perf_counter()
 
             if NCCL_LOG:
                 print(f'[{_ts()}] [forward_batch_generation] DRAFT DONE', flush=True)
@@ -354,6 +364,11 @@ class SpecWorker(TpModelWorker):
             logits_output, verify_output, _, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+
+            if _SGLANG_PROF:
+                torch.cuda.synchronize()
+                _fbg_t2 = time.perf_counter()
+
             if NCCL_LOG:
                 print(f'[{_ts()}] [forward_batch_generation] VERIFY DONE', flush=True)
                 print(f"[{_ts()}] {logits_output.hidden_states.shape=}, {logits_output.hidden_states=}", flush=True)
@@ -370,6 +385,12 @@ class SpecWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+
+            if _SGLANG_PROF:
+                torch.cuda.synchronize()
+                _fbg_t3 = time.perf_counter()
+                _n_acc = verify_output.accept_length_cpu.sum().item() if hasattr(verify_output, 'accept_length_cpu') and verify_output.accept_length_cpu is not None else -1
+                print(f"[PROFILE sglang] handshake={(_fbg_t1-_fbg_t0)*1000:.2f}ms verify={(_fbg_t2-_fbg_t1)*1000:.2f}ms postprocess={(_fbg_t3-_fbg_t2)*1000:.2f}ms total={(_fbg_t3-_fbg_t0)*1000:.2f}ms toks={_n_acc}", flush=True)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -775,6 +796,9 @@ class SpecWorker(TpModelWorker):
             ).cpu()
 
         # Forward
+        if _SGLANG_PROF:
+            torch.cuda.synchronize()
+            _vfy_fwd_t0 = time.perf_counter()
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
@@ -782,6 +806,9 @@ class SpecWorker(TpModelWorker):
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
+        if _SGLANG_PROF:
+            torch.cuda.synchronize()
+            _vfy_fwd_t1 = time.perf_counter()
 
         vocab_mask = None
         if batch.has_grammar:
@@ -806,6 +833,9 @@ class SpecWorker(TpModelWorker):
         if self.enable_nan_detection:
             detect_nan(logits_output)
 
+        if _SGLANG_PROF:
+            torch.cuda.synchronize()
+            _vfy_acc_t0 = time.perf_counter()
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
             batch,
@@ -821,6 +851,10 @@ class SpecWorker(TpModelWorker):
             res.accepted_indices
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        if _SGLANG_PROF:
+            torch.cuda.synchronize()
+            _vfy_acc_t1 = time.perf_counter()
+            print(f"[PROFILE sglang_verify] target_fwd={(_vfy_fwd_t1-_vfy_fwd_t0)*1000:.2f}ms token_accept={(_vfy_acc_t1-_vfy_acc_t0)*1000:.2f}ms", flush=True)
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None

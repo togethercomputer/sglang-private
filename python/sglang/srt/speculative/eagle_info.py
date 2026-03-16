@@ -1,3 +1,5 @@
+import os
+_SGLANG_PROF = os.environ.get("SSD_PROFILE", "0") == "1"
 import logging
 from copy import copy
 from dataclasses import dataclass
@@ -443,6 +445,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # FIXME: this `tolist()` fixes the numerical calculation consistency
         # try to unify the tensor representation and list representation
         accept_length_list = accept_length_cpu.tolist()
+        if _SGLANG_PROF:
+            print(f"[PROFILE sglang_accept] accept_lengths={accept_length_list}", flush=True)
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
