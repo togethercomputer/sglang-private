@@ -211,6 +211,11 @@ class AsyncSpecWorker(SpecWorker):
         accept_length = forward_batch.spec_info.accept_length
         if accept_length is None:
             accept_length = -2  # first decode, no prior acceptance
+        else:
+            # SGLang's accept_length includes the verified token (+1 added in
+            # prepare_extend_after_decode), but SSD expects it without the
+            # verified token.  Subtract 1 to match SSD convention.
+            accept_length = accept_length - 1
         self._cache_keys[:, 0] = request_ids
         self._cache_keys[:, 1] = accept_length
         self._cache_keys[:, 2] = forward_batch.spec_info.verified_id
