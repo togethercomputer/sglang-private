@@ -581,6 +581,7 @@ class Scheduler(
             speculate=True,
             speculate_k=self.server_args.speculative_num_steps,
             draft_async=True,
+            async_fan_out=self.server_args.speculative_async_fan_out,
             fan_out_list=self.server_args.speculative_async_fan_out_list,
             fan_out_list_miss=self.server_args.speculative_async_fan_out_list_miss,
             gpu_memory_utilization=0.8,
