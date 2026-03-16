@@ -164,8 +164,9 @@ class AsyncSpecWorker(SpecWorker):
         draft_block_table, max_blocks = self._get_draft_block_table(forward_batch)
         cmd = torch.tensor([1], dtype=torch.int64, device=self.device)
         eagle_acts = forward_batch.spec_info.hidden_states if self.speculative_algorithm.is_eagle() else None
-        print(f'[{_ts()}] [draft_extend_forward_pass] max_blocks={max_blocks}', flush=True)
-        print(f'[{_ts()}] [draft_extend_forward_pass] input_ids.shape={forward_batch.input_ids.shape}', flush=True)
+        if NCCL_LOG:
+            print(f'[{_ts()}] [draft_extend_forward_pass] max_blocks={max_blocks}', flush=True)
+            print(f'[{_ts()}] [draft_extend_forward_pass] input_ids.shape={forward_batch.input_ids.shape}', flush=True)
         metadata = prepare_prefill_metadata(
             forward_batch.input_ids.shape[0],
             forward_batch.batch_size,
@@ -200,7 +201,8 @@ class AsyncSpecWorker(SpecWorker):
     # Decode forward pass for async spec worker (runs on separate process).
     def _draft_forward(self, forward_batch: ForwardBatch, request_ids: torch.tensor = None):
         assert request_ids is not None
-        print(f'[{_ts()}] [draft_forward] SENDING SPECULATION REQUEST', flush=True)
+        if NCCL_LOG:
+            print(f'[{_ts()}] [draft_forward] SENDING SPECULATION REQUEST', flush=True)
         B = forward_batch.batch_size
         draft_block_table, max_blocks = self._get_draft_block_table(forward_batch)
         if B != self._hs_B:
@@ -246,8 +248,9 @@ class AsyncSpecWorker(SpecWorker):
             self.async_process_group,
             self.async_rank,
         )
-        print(f'[{_ts()}] [draft_forward] SPECULATION REQUEST SENT', flush=True)
-        print(f'[{_ts()}] [draft_forward] RECEIVING SPECULATION RESPONSE', flush=True)
+        if NCCL_LOG:
+            print(f'[{_ts()}] [draft_forward] SPECULATION REQUEST SENT', flush=True)
+            print(f'[{_ts()}] [draft_forward] RECEIVING SPECULATION RESPONSE', flush=True)
         speculations, _, _ = receive_speculation_response(
             B,
             self.speculative_num_steps,
@@ -257,8 +260,8 @@ class AsyncSpecWorker(SpecWorker):
             self.async_rank,
             skip_logits=True
         )
-        print(f'[{_ts()}] [draft_forward] SPECULATION RESPONE RECEIVED', flush=True)
         if NCCL_LOG:
+            print(f'[{_ts()}] [draft_forward] SPECULATION RESPONE RECEIVED', flush=True)
             sep = '=' * 80
             print(f"[{_ts()}] \n{sep}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC_RESP] speculations shape={speculations.shape}", flush=True)
