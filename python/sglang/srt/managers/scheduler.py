@@ -575,8 +575,15 @@ class Scheduler(
         print(f"[{_ts()}] token_to_kv_pool.size={kv_cache_size}")
         print(f"[{_ts()}] req_to_token_pool.max_context_len={self.tp_worker.model_runner.req_to_token_pool.max_context_len}")
 
+        if not os.path.exists(self.server_args.speculative_draft_model_path):
+            # Resolve HuggingFace model ID to local cache path
+            from huggingface_hub import snapshot_download
+            self.server_args.speculative_draft_model_path = snapshot_download(self.server_args.speculative_draft_model_path)
+            print(f"[{_ts()}] Downloaded draft model to {self.server_args.speculative_draft_model_path}")
+
         config = Config(
-            model=self.server_args.speculative_draft_model_path,  # TODO: accept revision
+            draft=self.server_args.speculative_draft_model_path,  # TODO: accept revision
+            model=self.server_args.speculative_draft_model_path,  # This is unused in async spec.
             num_gpus=2,  # Total dist world size: target (rank 0) + draft (rank 1)
             speculate=True,
             speculate_k=self.server_args.speculative_num_steps,
@@ -587,7 +594,6 @@ class Scheduler(
             gpu_memory_utilization=0.8,
             tokenizer_path=self.server_args.tokenizer_path if eagle else None,
             d_model_target=self.model_config.hidden_size if eagle else None,
-            draft=self.server_args.speculative_draft_model_path,  # TODO: accept revision
             kvcache_block_size=1,
             num_kvcache_blocks=kv_cache_size,
             max_num_seqs=self.server_args.max_running_requests or 64,
@@ -597,7 +603,6 @@ class Scheduler(
             async_nccl_port=async_spec_nccl_port,
             # Currently always do greedy drafting in async spec, no need for draft to return logits.
             skip_return_logits=True,
-            verbose=True,  # TODO: Delete this, it's just for debugging
         )
 
         init_q = ctx.Queue()
