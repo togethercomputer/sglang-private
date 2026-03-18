@@ -482,6 +482,8 @@ class ServerArgs:
     speculative_async_jit_speculate: bool = False
     speculative_async_sampler_x: Optional[float] = None
     speculative_async_draft_temperature: Optional[float] = None
+    speculative_async_remote_draft: bool = False
+    speculative_async_port: Optional[int] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -4087,6 +4089,21 @@ class ServerArgs:
             type=float,
             default=ServerArgs.speculative_async_draft_temperature,
             help="Override draft model temperature for async speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-async-remote-draft",
+            action="store_true",
+            default=ServerArgs.speculative_async_remote_draft,
+            help="Enable remote draft runner mode for cross-node async speculative decoding. "
+            "When set, the draft runner is expected to be launched independently (e.g., on a remote node) "
+            "using scripts/launch_remote_draft.py. Requires --speculative-async-port.",
+        )
+        parser.add_argument(
+            "--speculative-async-port",
+            type=int,
+            default=ServerArgs.speculative_async_port,
+            help="Fixed NCCL port for cross-node async speculative decoding. "
+            "Both target and draft must use the same port.",
         )
 
         # Expert parallelism

@@ -560,15 +560,7 @@ class Scheduler(
         import torch.multiprocessing as mp
         from torch.distributed import TCPStore
 
-        draft_gpu_id = self.server_args.tp_size
-        async_spec_nccl_port = get_open_port()
-
-        logger.info(
-            f"Spawning async draft runner on GPU {draft_gpu_id}, "
-            f"NCCL port {async_spec_nccl_port}"
-        )
-
-        ctx = mp.get_context("spawn")
+        cross_node = self.server_args.speculative_async_remote_draft
 
         eagle = self.spec_algorithm.is_eagle()
         kv_cache_size = self.tp_worker.model_runner.token_to_kv_pool.size
@@ -580,6 +572,28 @@ class Scheduler(
             from huggingface_hub import snapshot_download
             self.server_args.speculative_draft_model_path = snapshot_download(self.server_args.speculative_draft_model_path)
             print(f"[{_ts()}] Downloaded draft model to {self.server_args.speculative_draft_model_path}")
+
+        if cross_node:
+            # Cross-node mode: draft runner launched independently on remote node.
+            # Use user-specified or auto-selected NCCL port.
+            async_spec_nccl_port = self.server_args.speculative_async_port
+            if async_spec_nccl_port is None:
+                raise ValueError(
+                    "--speculative-async-port must be specified for cross-node async spec "
+                    "(both target and draft nodes must use the same port)"
+                )
+            logger.info(
+                f"Cross-node async spec: NCCL port={async_spec_nccl_port}, "
+                f"draft runner expected on remote node"
+            )
+        else:
+            # Local mode: draft runner spawned on same node.
+            draft_gpu_id = self.server_args.tp_size
+            async_spec_nccl_port = self.server_args.speculative_async_port or get_open_port()
+            logger.info(
+                f"Spawning async draft runner on GPU {draft_gpu_id}, "
+                f"NCCL port {async_spec_nccl_port}"
+            )
 
         config = Config(
             draft=self.server_args.speculative_draft_model_path,  # TODO: accept revision
@@ -594,6 +608,7 @@ class Scheduler(
             gpu_memory_utilization=0.8,
             tokenizer_path=self.server_args.tokenizer_path if eagle else None,
             d_model_target=self.model_config.hidden_size if eagle else None,
+            use_eagle=eagle,
             kvcache_block_size=1,
             num_kvcache_blocks=kv_cache_size,
             max_num_seqs=self.server_args.max_running_requests or 64,
@@ -603,24 +618,29 @@ class Scheduler(
             async_nccl_port=async_spec_nccl_port,
             # Currently always do greedy drafting in async spec, no need for draft to return logits.
             skip_return_logits=True,
+            verbose=True,
         )
 
         async_pg = None
         if self.tp_rank == 0:
-            init_q = ctx.Queue()
-            self.draft_process = ctx.Process(
-                target=_run_draft_runner,
-                args=(config, draft_gpu_id, init_q),
-                daemon=True,
-            )
-            self.draft_process.start()
+            if not cross_node:
+                # Local mode: spawn draft runner process on same node.
+                ctx = mp.get_context("spawn")
+                init_q = ctx.Queue()
+                self.draft_process = ctx.Process(
+                    target=_run_draft_runner,
+                    args=(config, draft_gpu_id, init_q),
+                    daemon=True,
+                )
+                self.draft_process.start()
 
             # Create custom process group (rank=0, target side).
             # This blocks until the DraftRunner (rank=1) also calls
             # init_custom_process_group during its model load.
             device = torch.device(f"cuda:{self.gpu_id}")
+            tcpstore_host = "0.0.0.0" if cross_node else "127.0.0.1"
             store = TCPStore(
-                host_name="127.0.0.1",
+                host_name=tcpstore_host,
                 port=async_spec_nccl_port,
                 world_size=2,
                 is_master=True,
@@ -634,29 +654,47 @@ class Scheduler(
                     group_name="async_spec",
                 )
 
-            # Wait for draft runner to be ready
-            # DraftRunner/ModelRunner sends num_kvcache_blocks (int) via init_q
-            logger.info("Waiting for async draft runner to initialize...")
-            result = None
-            try:
-                result = init_q.get(timeout=180)
-            except Exception:
-                alive = self.draft_process.is_alive()
-                exitcode = self.draft_process.exitcode
-                raise RuntimeError(
-                    f"Timed out waiting for async draft runner to initialize. "
-                    f"Draft process alive={alive}, exitcode={exitcode}"
-                )
-            init_q.close()
+            # Send kv_cache_size to draft so it allocates matching KV cache blocks.
+            # This must happen right after NCCL group formation and before the draft
+            # allocates its KV cache.
+            kv_buf = torch.tensor([kv_cache_size], dtype=torch.int64, device=device)
+            torch.distributed.send(kv_buf, dst=1, group=async_pg)
+            logger.info(f"Sent kv_cache_size={kv_cache_size} to draft via NCCL")
 
-            if isinstance(result, dict) and "error" in result:
-                raise RuntimeError(
-                    f"Async draft runner failed to start:\n{result['error']}"
+            if cross_node:
+                # Cross-node mode: receive num_kvcache_blocks via NCCL
+                # (draft sends this after full init instead of using mp.Queue).
+                logger.info("Waiting for remote draft runner to signal readiness via NCCL...")
+                ready_buf = torch.empty(1, dtype=torch.int64, device=device)
+                torch.distributed.recv(ready_buf, src=1, group=async_pg)
+                num_kvcache_blocks = ready_buf.item()
+                logger.info(
+                    f"Remote draft runner ready, num_kvcache_blocks={num_kvcache_blocks}"
                 )
-            num_kvcache_blocks = result
+            else:
+                # Local mode: wait for draft runner via mp.Queue.
+                logger.info("Waiting for async draft runner to initialize...")
+                result = None
+                try:
+                    result = init_q.get(timeout=180)
+                except Exception:
+                    alive = self.draft_process.is_alive()
+                    exitcode = self.draft_process.exitcode
+                    raise RuntimeError(
+                        f"Timed out waiting for async draft runner to initialize. "
+                        f"Draft process alive={alive}, exitcode={exitcode}"
+                    )
+                init_q.close()
 
+                if isinstance(result, dict) and "error" in result:
+                    raise RuntimeError(
+                        f"Async draft runner failed to start:\n{result['error']}"
+                    )
+                num_kvcache_blocks = result
+
+            draft_location = "remote node" if cross_node else f"GPU {draft_gpu_id}"
             logger.info(
-                f"Async draft runner ready on GPU {draft_gpu_id}, "
+                f"Async draft runner ready on {draft_location}, "
                 f"num_kvcache_blocks={num_kvcache_blocks}"
             )
             if num_kvcache_blocks != kv_cache_size:
