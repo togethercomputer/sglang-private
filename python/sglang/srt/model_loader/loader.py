@@ -88,6 +88,7 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
+    buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
@@ -99,7 +100,6 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
-    multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -469,6 +469,9 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
+        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+            hf_weights_files.sort()
+
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
@@ -508,7 +511,7 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                 )
             elif use_multithread:
-                weights_iterator = multi_thread_safetensors_weights_iterator(
+                weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
                         "num_threads", self.DEFAULT_NUM_THREADS
@@ -2725,7 +2728,8 @@ def get_model_loader(
 
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
-        or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
+        or model_config.quantization
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
         logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
         return ModelOptModelLoader(load_config)
@@ -2734,7 +2738,8 @@ def get_model_loader(
     if (
         model_config
         and hasattr(model_config, "quantization")
-        and model_config.quantization in ["modelopt_fp8", "modelopt_fp4"]
+        and model_config.quantization
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
     ):
         if model_config._is_already_quantized():
             logger.info(
