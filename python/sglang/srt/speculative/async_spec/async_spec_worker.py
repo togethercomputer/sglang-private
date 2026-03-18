@@ -39,6 +39,7 @@ class ModelConfigStub:
         self.is_local_attention_model = False
         self.vocab_size = vocab_size
         self.dtype = dtype
+        self.hf_config = None
 
 class ModelRunnerStub:
 
@@ -159,10 +160,12 @@ class AsyncSpecWorker(SpecWorker):
     def _capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        pass
+        if self.speculative_algorithm.is_eagle():
+            draft_input.hidden_states = logits_output.hidden_states
 
     def _prepare_for_extend(self, batch: ScheduleBatch):
-        pass
+        if self.speculative_algorithm.is_eagle():
+            batch.spec_info.prepare_for_extend(batch)
 
     # Prefill forward pass for async spec worker.
     def _draft_extend_forward_pass(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:

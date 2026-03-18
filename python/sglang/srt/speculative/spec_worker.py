@@ -162,7 +162,7 @@ class SpecWorker(TpModelWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
 
-        if self.speculative_algorithm.is_eagle():
+        if self.speculative_algorithm.is_eagle() and not self.speculative_algorithm.is_async():
             self._set_embed_and_head_from_target()
 
         # Init attention backend and cuda graphs
