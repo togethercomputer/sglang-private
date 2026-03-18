@@ -505,7 +505,7 @@ class ServerArgs:
     speculative_async_sampler_x: Optional[float] = None
     speculative_async_draft_temperature: Optional[float] = None
     speculative_async_remote_draft: bool = False
-    speculative_async_port: Optional[int] = None
+    speculative_async_port: int = 29600
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1

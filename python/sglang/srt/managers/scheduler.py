@@ -603,7 +603,7 @@ class Scheduler(
         from sglang.srt.speculative.async_spec.async_spec_worker import (
             AsyncSpecWorker,
         )
-        from sglang.srt.utils.common import get_open_port, init_custom_process_group
+        from sglang.srt.utils.common import init_custom_process_group
 
         import torch.multiprocessing as mp
         from torch.distributed import TCPStore
@@ -621,15 +621,16 @@ class Scheduler(
             self.server_args.speculative_draft_model_path = snapshot_download(self.server_args.speculative_draft_model_path)
             print(f"[{_ts()}] Downloaded draft model to {self.server_args.speculative_draft_model_path}")
 
+        async_spec_nccl_port = self.server_args.speculative_async_port
+        if async_spec_nccl_port is None:
+            raise ValueError(
+                "--speculative-async-port must be specified for cross-node async spec "
+                "(both target and draft nodes must use the same port)"
+            )
+
         if cross_node:
             # Cross-node mode: draft runner launched independently on remote node.
             # Use user-specified or auto-selected NCCL port.
-            async_spec_nccl_port = self.server_args.speculative_async_port
-            if async_spec_nccl_port is None:
-                raise ValueError(
-                    "--speculative-async-port must be specified for cross-node async spec "
-                    "(both target and draft nodes must use the same port)"
-                )
             logger.info(
                 f"Cross-node async spec: NCCL port={async_spec_nccl_port}, "
                 f"draft runner expected on remote node"
@@ -637,7 +638,6 @@ class Scheduler(
         else:
             # Local mode: draft runner spawned on same node.
             draft_gpu_id = self.server_args.tp_size
-            async_spec_nccl_port = self.server_args.speculative_async_port or get_open_port()
             logger.info(
                 f"Spawning async draft runner on GPU {draft_gpu_id}, "
                 f"NCCL port {async_spec_nccl_port}"
@@ -761,7 +761,9 @@ class Scheduler(
             tp_rank=self.tp_rank,
             dp_rank=self.dp_rank,
             moe_ep_rank=self.moe_ep_rank,
-            nccl_port=self.nccl_port,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_dp_rank=self.moe_dp_rank,
+            nccl_port=async_spec_nccl_port,
             target_worker=self.tp_worker,
             async_process_group=async_pg,
             # For this custom process group, rank 1 is the draft runner, rank 0 is the target.

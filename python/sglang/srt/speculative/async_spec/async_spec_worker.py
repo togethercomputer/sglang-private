@@ -41,6 +41,7 @@ class ModelConfigStub:
         self.dtype = dtype
         self.hf_config = None
 
+
 class ModelRunnerStub:
 
     def __init__(
@@ -63,6 +64,8 @@ class ModelRunnerStub:
             vocab_size=target_worker.model_runner.model_config.vocab_size,
             dtype=target_worker.model_runner.model_config.dtype,
         )
+        self.use_ngram_embedding = False
+        self.is_hybrid_swa = False
 
 
 class AsyncSpecWorker(SpecWorker):
@@ -74,12 +77,14 @@ class AsyncSpecWorker(SpecWorker):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
         async_process_group: dist.ProcessGroup,
         async_rank: int,
     ):
-        super().__init__(server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker)
+        super().__init__(server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, attn_cp_rank, moe_dp_rank, nccl_port, target_worker)
         self.async_process_group = async_process_group
         self.async_rank = async_rank
         self._is_async_leader = (async_process_group is not None)
