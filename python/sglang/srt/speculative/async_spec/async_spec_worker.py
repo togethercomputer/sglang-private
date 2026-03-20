@@ -6,10 +6,9 @@ import torch
 import torch.distributed as dist
 
 from ssd.engine.helpers.runner_helpers import (
-    prepare_prefill_metadata,
-    send_prefill_request,
-    send_speculation_request,
-    receive_speculation_response,
+    PrefillRequest,
+    SpeculationRequest,
+    SpeculationResponse,
 )
 
 from sglang.srt.configs.model_config import AttentionArch
@@ -93,32 +92,32 @@ class AsyncSpecWorker(SpecWorker):
         MQ_LEN = sum(self.server_args.speculative_async_fan_out_list)
         # K from the glue decode, MQ_LEN * K from the tree decode.
         self.num_tokens_for_async_draft_tree = K * (MQ_LEN + 1) + 1
-        self._alloc_handshake_bufs(1)
+        B = 1
+        self._speculation_request = SpeculationRequest.prepare(
+            batch_size=B,
+            lookahead=K,
+            max_blocks=-1,
+            vocab_size=-1,
+            draft_dtype=self.model_runner.model_config.dtype,
+            device=self.device,
+            eagle=self.speculative_algorithm.is_eagle(),
+            eagle_act_dim=0,  # TODO TO FIX EAGLE
+        )
+        self._speculation_response = SpeculationResponse.prepare(
+            lookahead=K,
+            device=self.device,
+            draft_dtype=self.model_runner.model_config.dtype,
+            batch_size=B,
+        )
+        self._alloc_tree_verification_bufs(B)
 
-    def _alloc_handshake_bufs(self, B, max_blocks: int = -1):
-        self._hs_B = B
+    def _alloc_tree_verification_bufs(self, B):
         K = self.speculative_num_steps
-        d = self.device
-        self._cmd = torch.zeros(1, dtype=torch.int64, device=d)
-        self._meta = torch.tensor([
-            B,
-            K,
-            self.server_args.speculative_async_fan_out,
-            max_blocks,
-        ], dtype=torch.int64, device=d)
-        self._cache_keys = torch.empty(B, 3, dtype=torch.int64, device=d)
-        self._num_tokens_buf = torch.empty(B, dtype=torch.int64, device=d)
-        self._temps_buf = torch.zeros(B, dtype=torch.int64, device=d)
-        # self._block_tables_buf = torch.full((B, self.max_blocks), -1, dtype=torch.int32, device=d)
-        self._fused_response = torch.empty(B + B * K, dtype=torch.int64, device=d)
-        # For now we don't need logits because speculation is always greedy
-        self._logits_q = None
-        self._extend_counts = torch.zeros(B, dtype=torch.int64, device=d)
         self._parent_list = torch.arange(
-            -1, K - 1, dtype=torch.int64, device=d,
+            -1, K - 1, dtype=torch.int64, device=self.device,
         ).unsqueeze(0).repeat(B, 1)
         self._top_scores_index = torch.arange(
-            0, K, dtype=torch.int64, device=d,
+            0, K, dtype=torch.int64, device=self.device,
         ).unsqueeze(0).repeat(B, 1)
 
     def _get_draft_block_table(
@@ -175,18 +174,18 @@ class AsyncSpecWorker(SpecWorker):
     # Prefill forward pass for async spec worker.
     def _draft_extend_forward_pass(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         draft_block_table, max_blocks = self._get_draft_block_table(forward_batch)
-        cmd = torch.tensor([1], dtype=torch.int64, device=self.device)
         eagle_acts = forward_batch.spec_info.hidden_states if self.speculative_algorithm.is_eagle() else None
         if NCCL_LOG:
             print(f'[{_ts()}] [draft_extend_forward_pass] max_blocks={max_blocks}', flush=True)
             print(f'[{_ts()}] [draft_extend_forward_pass] input_ids.shape={forward_batch.input_ids.shape}', flush=True)
-        metadata = prepare_prefill_metadata(
-            forward_batch.input_ids.shape[0],
-            forward_batch.batch_size,
-            max_blocks,
-            eagle_acts is not None,
-            eagle_acts.shape[1] if eagle_acts is not None else 0,
-            self.device,
+
+        prefill_request = PrefillRequest.prepare(
+            input_ids=forward_batch.input_ids,
+            num_tokens=forward_batch.extend_seq_lens,
+            draft_block_table=draft_block_table,
+            eagle_acts=eagle_acts,
+            max_blocks=max_blocks,
+            device=self.device,
         )
         if NCCL_LOG:
             sep = '=' * 80
@@ -196,19 +195,13 @@ class AsyncSpecWorker(SpecWorker):
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] input_ids decoded='{_decode_ids(forward_batch.input_ids)}'", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] extend_seq_lens={forward_batch.extend_seq_lens.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] metadata={metadata.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] metadata={prefill_request.metadata.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] req_pool_indices={forward_batch.req_pool_indices.tolist()}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
         if self._is_async_leader:
-            send_prefill_request(
-                cmd,
-                metadata,
-                forward_batch.input_ids,
-                forward_batch.extend_seq_lens,
-                draft_block_table,
-                eagle_acts,
-                self.async_process_group,
-                self.async_rank,
+            prefill_request.send(
+                async_pg=self.async_process_group,
+                draft_rank=self.async_rank,
             )
         return LogitsProcessorOutput(None, None)
 
@@ -219,10 +212,12 @@ class AsyncSpecWorker(SpecWorker):
             print(f'[{_ts()}] [draft_forward] SENDING SPECULATION REQUEST', flush=True)
         B = forward_batch.batch_size
         draft_block_table, max_blocks = self._get_draft_block_table(forward_batch)
-        if B != self._hs_B:
-            self._alloc_handshake_bufs(B, max_blocks)
-        else:
-            self._meta[3] = max_blocks
+        if B != self._speculation_request.batch_size:
+            self._speculation_request.maybe_update_buffers(B, max_blocks=-1)
+            self._alloc_tree_verification_bufs(B)
+
+        self._speculation_request.metadata[2] = max_blocks
+        self._speculation_request.block_tables = draft_block_table
 
         accept_length = forward_batch.spec_info.accept_length
         if accept_length is None:
@@ -232,13 +227,17 @@ class AsyncSpecWorker(SpecWorker):
             # prepare_extend_after_decode), but SSD expects it without the
             # verified token.  Subtract 1 to match SSD convention.
             accept_length = accept_length - 1
-        self._cache_keys[:, 0] = request_ids
-        self._cache_keys[:, 1] = accept_length
-        self._cache_keys[:, 2] = forward_batch.spec_info.verified_id
-        self._num_tokens_buf = forward_batch.seq_lens + 1
-        # self._temps_buf = forward_batch.spec_info.temperature
-        # self._block_tables_buf = forward_batch.spec_info.draft_block_table
+
+        self._speculation_request.cache_keys[:, 0] = request_ids
+        self._speculation_request.cache_keys[:, 1] = accept_length
+        self._speculation_request.cache_keys[:, 2] = forward_batch.spec_info.verified_id
+        self._speculation_request.num_tokens[:] = forward_batch.seq_lens + 1
+        # TODO: Set temperatures
         if NCCL_LOG:
+            cache_keys = self._speculation_request.cache_keys
+            num_tokens = self._speculation_request.num_tokens
+            temps = self._speculation_request.temps
+            metadata = self._speculation_request.metadata
             sep = '=' * 80
             print(f"[{_ts()}] \n{sep}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] B={B}, K={self.speculative_num_steps}", flush=True)
@@ -246,25 +245,20 @@ class AsyncSpecWorker(SpecWorker):
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] accept_length={accept_length if isinstance(accept_length, int) else accept_length.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] verified_id={forward_batch.spec_info.verified_id.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] verified_id decoded={_decode_id_list(forward_batch.spec_info.verified_id)}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] cache_keys shape={self._cache_keys.shape}, values={self._cache_keys.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] num_tokens (seq_lens+1)={self._num_tokens_buf.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] cache_keys shape={cache_keys.shape}, values={cache_keys.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] num_tokens (seq_lens+1)={num_tokens.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] temps={self._temps_buf.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] meta={self._meta.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] temps={temps.tolist()}", flush=True)
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] metadata={metadata.tolist()}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
+
         if self._is_async_leader:
             if _SGLANG_PROF:
                 torch.cuda.synchronize()
                 _df_t0 = _time.perf_counter()
-            send_speculation_request(
-                self._cmd,
-                self._meta,
-                self._cache_keys,
-                self._num_tokens_buf,
-                draft_block_table,
-                self._temps_buf,
-                self.async_process_group,
-                self.async_rank,
+            self._speculation_request.send(
+                async_pg=self.async_process_group,
+                draft_rank=self.async_rank,
             )
             if _SGLANG_PROF:
                 torch.cuda.synchronize()
@@ -272,15 +266,14 @@ class AsyncSpecWorker(SpecWorker):
             if NCCL_LOG:
                 print(f'[{_ts()}] [draft_forward] SPECULATION REQUEST SENT', flush=True)
                 print(f'[{_ts()}] [draft_forward] RECEIVING SPECULATION RESPONSE', flush=True)
-            speculations, _, _ = receive_speculation_response(
-                B,
-                self.speculative_num_steps,
-                self._fused_response,
-                self._logits_q,
-                self.async_process_group,
-                self.async_rank,
-                skip_logits=True
+
+
+            self._speculation_response.receive(
+                async_pg=self.async_process_group,
+                draft_rank=self.async_rank,
+                batch_size=B,
             )
+            speculations = self._speculation_response.speculations
             if _SGLANG_PROF:
                 torch.cuda.synchronize()
                 _df_t2 = _time.perf_counter()

@@ -665,7 +665,8 @@ class Scheduler(
             max_steps=self.server_args.max_total_tokens,
             async_nccl_port=async_spec_nccl_port,
             # Currently always do greedy drafting in async spec, no need for draft to return logits.
-            skip_return_logits=True,
+            communicate_logits=False,
+            communicate_cache_hits=False,
             verbose=True,
         )
 
