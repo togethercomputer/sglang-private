@@ -2965,6 +2965,10 @@ class ServerArgs:
                 raise ValueError(
                     "Async speculative decoding requires --speculative-draft-model-path to be set."
                 )
+            if self.speculative_algorithm != "ASYNC_EAGLE3":
+                raise ValueError(
+                    "The only type of Eagle algorithm supported in async speculative decoding is Eagle3 for now."
+                )
 
             if self.page_size != 1:
                 logger.warning(

@@ -599,6 +599,7 @@ class Scheduler(
     def _init_async_spec_worker(self):
         """Initialize the async spec worker with a dedicated draft GPU process."""
         from ssd.config import Config
+        from ssd.engine.draft_runner import DraftRunner
 
         from sglang.srt.speculative.async_spec.async_spec_worker import (
             AsyncSpecWorker,
@@ -643,9 +644,10 @@ class Scheduler(
                 f"NCCL port {async_spec_nccl_port}"
             )
 
+        target_hidden_size = self.model_config.hidden_size if eagle else 0
         config = Config(
             draft=self.server_args.speculative_draft_model_path,  # TODO: accept revision
-            model=self.server_args.speculative_draft_model_path,  # This is unused in async spec.
+            model=self.server_args.model_path,
             num_gpus=2,  # Total dist world size: target (rank 0) + draft (rank 1)
             speculate=True,
             speculate_k=self.server_args.speculative_num_steps,
@@ -655,7 +657,7 @@ class Scheduler(
             fan_out_list_miss=self.server_args.speculative_async_fan_out_list_miss,
             gpu_memory_utilization=0.8,
             tokenizer_path=self.server_args.tokenizer_path if eagle else None,
-            d_model_target=self.model_config.hidden_size if eagle else None,
+            d_model_target=target_hidden_size,
             use_eagle=eagle,
             kvcache_block_size=1,
             num_kvcache_blocks=kv_cache_size,
@@ -669,6 +671,7 @@ class Scheduler(
             communicate_cache_hits=False,
             verbose=True,
         )
+        config = DraftRunner.create_draft_config(config)
 
         async_pg = None
         if self.tp_rank == 0:
@@ -758,6 +761,7 @@ class Scheduler(
         # Only rank 0 has async_pg != None; other ranks will broadcast from rank 0.
         self.draft_worker = AsyncSpecWorker(
             server_args=self.server_args,
+            target_hidden_size=target_hidden_size,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
             dp_rank=self.dp_rank,

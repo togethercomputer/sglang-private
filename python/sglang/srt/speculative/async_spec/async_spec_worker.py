@@ -10,6 +10,7 @@ from ssd.engine.helpers.runner_helpers import (
     SpeculationRequest,
     SpeculationResponse,
 )
+from ssd.utils.misc import compress_neg_ones_and_zeros
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -27,7 +28,6 @@ logger = logging.getLogger(__name__)
 NCCL_LOG = os.environ.get("SSD_NCCL_LOG", "0") == "1"
 _SGLANG_PROF = os.environ.get('SSD_PROFILE', '0') == '1'
 import time as _time
-
 
 
 class ModelConfigStub:
@@ -72,6 +72,7 @@ class AsyncSpecWorker(SpecWorker):
     def __init__(
         self,
         server_args: ServerArgs,
+        target_hidden_size: int,
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
@@ -101,7 +102,7 @@ class AsyncSpecWorker(SpecWorker):
             draft_dtype=self.model_runner.model_config.dtype,
             device=self.device,
             eagle=self.speculative_algorithm.is_eagle(),
-            eagle_act_dim=0,  # TODO TO FIX EAGLE
+            eagle_act_dim=3 * target_hidden_size,
         )
         self._speculation_response = SpeculationResponse.prepare(
             lookahead=K,
@@ -168,22 +169,29 @@ class AsyncSpecWorker(SpecWorker):
             draft_input.hidden_states = logits_output.hidden_states
 
     def _prepare_for_extend(self, batch: ScheduleBatch):
+        pass
         if self.speculative_algorithm.is_eagle():
-            batch.spec_info.prepare_for_extend(batch)
+            # Duplicate the first hidden state, and remove the last hidden state, so that the sequence length is the same as the input_ids.
+            batch.spec_info.hidden_states = torch.cat([
+                batch.spec_info.hidden_states[:1, :], batch.spec_info.hidden_states[:-1, :],
+            ], dim=0)
 
-    # Prefill forward pass for async spec worker.
     def _draft_extend_forward_pass(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         draft_block_table, max_blocks = self._get_draft_block_table(forward_batch)
-        eagle_acts = forward_batch.spec_info.hidden_states if self.speculative_algorithm.is_eagle() else None
+        target_hidden_states = forward_batch.spec_info.hidden_states if self.speculative_algorithm.is_eagle() else None
         if NCCL_LOG:
             print(f'[{_ts()}] [draft_extend_forward_pass] max_blocks={max_blocks}', flush=True)
             print(f'[{_ts()}] [draft_extend_forward_pass] input_ids.shape={forward_batch.input_ids.shape}', flush=True)
+            if target_hidden_states is not None:
+                print(f'[{_ts()}] [draft_extend_forward_pass] target_hidden_states.shape={target_hidden_states.shape}', flush=True)
+            else:
+                print(f'[{_ts()}] [draft_extend_forward_pass] target_hidden_states is None', flush=True)
 
         prefill_request = PrefillRequest.prepare(
             input_ids=forward_batch.input_ids,
             num_tokens=forward_batch.extend_seq_lens,
             draft_block_table=draft_block_table,
-            eagle_acts=eagle_acts,
+            eagle_acts=target_hidden_states,
             max_blocks=max_blocks,
             device=self.device,
         )
@@ -194,7 +202,8 @@ class AsyncSpecWorker(SpecWorker):
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] input_ids shape={forward_batch.input_ids.shape}, values={forward_batch.input_ids.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] input_ids decoded='{_decode_ids(forward_batch.input_ids)}'", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] extend_seq_lens={forward_batch.extend_seq_lens.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
+            draft_block_table_values_str = compress_neg_ones_and_zeros(f"{draft_block_table.tolist()}")  # Replace 3 or more -1's with "-1, ..., -1" to avoid long lists
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] draft_block_table shape={draft_block_table.shape}, values={draft_block_table_values_str}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] metadata={prefill_request.metadata.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_PREFILL] req_pool_indices={forward_batch.req_pool_indices.tolist()}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
@@ -203,9 +212,8 @@ class AsyncSpecWorker(SpecWorker):
                 async_pg=self.async_process_group,
                 draft_rank=self.async_rank,
             )
-        return LogitsProcessorOutput(None, None)
+        return LogitsProcessorOutput(next_token_logits=None, hidden_states=target_hidden_states)
 
-    # Decode forward pass for async spec worker (runs on separate process).
     def _draft_forward(self, forward_batch: ForwardBatch, request_ids: torch.tensor = None):
         assert request_ids is not None
         if NCCL_LOG:
@@ -233,6 +241,30 @@ class AsyncSpecWorker(SpecWorker):
         self._speculation_request.cache_keys[:, 2] = forward_batch.spec_info.verified_id
         self._speculation_request.num_tokens[:] = forward_batch.seq_lens + 1
         # TODO: Set temperatures
+
+        if self.speculative_algorithm.is_eagle():
+            eagle_acts = forward_batch.spec_info.hidden_states
+            verified_id = forward_batch.spec_info.verified_id
+            seq_lens = forward_batch.seq_lens
+            if isinstance(accept_length, int):
+                assert accept_length == -2
+            else:
+                assert isinstance(accept_length, torch.Tensor)
+                assert accept_length.shape == (B,)
+
+            is_first_decode = accept_length == -2
+            a = 0
+            for i in range(B):
+                acc_len = seq_lens[i] if is_first_decode else accept_length[i]
+                b = max(min(a + acc_len, eagle_acts.shape[0]), 0)
+                self._speculation_request.extend_counts[i] = 0 if is_first_decode else acc_len
+                if eagle_acts is not None:
+                    self._speculation_request.recovery_activations[i, :] = eagle_acts[b - 1, :]
+                    if not is_first_decode and acc_len > 0:
+                        self._speculation_request.extend_activations[i, :acc_len] = eagle_acts[a: b, :]
+                        self._speculation_request.extend_token_ids[i, :acc_len] = verified_id[a: b]
+                        a += acc_len
+
         if NCCL_LOG:
             cache_keys = self._speculation_request.cache_keys
             num_tokens = self._speculation_request.num_tokens
@@ -247,9 +279,10 @@ class AsyncSpecWorker(SpecWorker):
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] verified_id decoded={_decode_id_list(forward_batch.spec_info.verified_id)}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] cache_keys shape={cache_keys.shape}, values={cache_keys.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] num_tokens (seq_lens+1)={num_tokens.tolist()}", flush=True)
-            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] draft_block_table shape={draft_block_table.shape}, values={draft_block_table.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] temps={temps.tolist()}", flush=True)
             print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] metadata={metadata.tolist()}", flush=True)
+            draft_block_table_values_str = compress_neg_ones_and_zeros(f"{draft_block_table.tolist()}")
+            print(f"[{_ts()}] [NCCL_LOG SGLANG_SPEC] draft_block_table shape={draft_block_table.shape}, values={draft_block_table_values_str}", flush=True)
             print(f"[{_ts()}] {sep}\n", flush=True)
 
         if self._is_async_leader:
