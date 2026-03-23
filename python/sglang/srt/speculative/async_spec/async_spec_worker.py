@@ -94,6 +94,15 @@ class AsyncSpecWorker(SpecWorker):
         # K from the glue decode, MQ_LEN * K from the tree decode.
         self.num_tokens_for_async_draft_tree = K * (MQ_LEN + 1) + 1
         B = 1
+        eagle3 = self.speculative_algorithm.is_eagle3()
+        phoenix = self.speculative_algorithm.is_phoenix()
+        if eagle3:
+            eagle_act_dim = 3 * target_hidden_size
+        elif phoenix:
+            eagle_act_dim = target_hidden_size
+        else:
+            eagle_act_dim = 0
+
         self._speculation_request = SpeculationRequest.prepare(
             batch_size=B,
             lookahead=K,
@@ -102,7 +111,7 @@ class AsyncSpecWorker(SpecWorker):
             draft_dtype=self.model_runner.model_config.dtype,
             device=self.device,
             eagle=self.speculative_algorithm.is_eagle(),
-            eagle_act_dim=3 * target_hidden_size,
+            eagle_act_dim=eagle_act_dim,
         )
         self._speculation_response = SpeculationResponse.prepare(
             lookahead=K,

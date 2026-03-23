@@ -22,6 +22,8 @@ class SpeculativeAlgorithm(Enum):
     ASYNC_STANDALONE = auto()
     ASYNC_EAGLE = auto()
     ASYNC_EAGLE3 = auto()
+    ASYNC_PHOENIX = auto()
+    ASYNC_PHOENIX2 = auto()
     NONE = auto()
 
     @classmethod
@@ -36,6 +38,12 @@ class SpeculativeAlgorithm(Enum):
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
 
+    def is_phoenix(self) -> bool:
+        return (
+            self == SpeculativeAlgorithm.ASYNC_PHOENIX
+            or self == SpeculativeAlgorithm.ASYNC_PHOENIX2
+        )
+
     def is_eagle(self) -> bool:
         # NOTE: EAGLE3 is a variant of EAGLE
         return (
@@ -43,6 +51,8 @@ class SpeculativeAlgorithm(Enum):
             or self == SpeculativeAlgorithm.EAGLE3
             or self == SpeculativeAlgorithm.ASYNC_EAGLE
             or self == SpeculativeAlgorithm.ASYNC_EAGLE3
+            or self == SpeculativeAlgorithm.ASYNC_PHOENIX
+            or self == SpeculativeAlgorithm.ASYNC_PHOENIX2
         )
 
     def is_eagle3(self) -> bool:
@@ -64,6 +74,8 @@ class SpeculativeAlgorithm(Enum):
             self == SpeculativeAlgorithm.ASYNC_STANDALONE
             or self == SpeculativeAlgorithm.ASYNC_EAGLE
             or self == SpeculativeAlgorithm.ASYNC_EAGLE3
+            or self == SpeculativeAlgorithm.ASYNC_PHOENIX
+            or self == SpeculativeAlgorithm.ASYNC_PHOENIX2
         )
 
     def supports_spec_v2(self) -> bool:

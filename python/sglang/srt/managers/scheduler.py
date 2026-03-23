@@ -611,7 +611,8 @@ class Scheduler(
 
         cross_node = self.server_args.speculative_async_remote_draft
 
-        eagle = self.spec_algorithm.is_eagle()
+        # TODO: A bit confusing that is_eagle() here includes Phoenix as well.
+        eagle_or_phoenix = self.spec_algorithm.is_eagle()
         kv_cache_size = self.tp_worker.model_runner.token_to_kv_pool.size
         print(f"[{_ts()}] token_to_kv_pool.size={kv_cache_size}")
         print(f"[{_ts()}] req_to_token_pool.max_context_len={self.tp_worker.model_runner.req_to_token_pool.max_context_len}")
@@ -644,7 +645,7 @@ class Scheduler(
                 f"NCCL port {async_spec_nccl_port}"
             )
 
-        target_hidden_size = self.model_config.hidden_size if eagle else 0
+        target_hidden_size = self.model_config.hidden_size if eagle_or_phoenix else 0
         config = Config(
             draft=self.server_args.speculative_draft_model_path,  # TODO: accept revision
             model=self.server_args.model_path,
@@ -656,9 +657,10 @@ class Scheduler(
             fan_out_list=self.server_args.speculative_async_fan_out_list,
             fan_out_list_miss=self.server_args.speculative_async_fan_out_list_miss,
             gpu_memory_utilization=0.8,
-            tokenizer_path=self.server_args.tokenizer_path if eagle else None,
+            tokenizer_path=self.server_args.tokenizer_path if eagle_or_phoenix else None,
             d_model_target=target_hidden_size,
-            use_eagle=eagle,
+            use_eagle=eagle_or_phoenix and not self.spec_algorithm.is_phoenix(),
+            use_phoenix=self.spec_algorithm.is_phoenix(),
             kvcache_block_size=1,
             num_kvcache_blocks=kv_cache_size,
             max_num_seqs=self.server_args.max_running_requests or 64,
@@ -669,7 +671,7 @@ class Scheduler(
             # Currently always do greedy drafting in async spec, no need for draft to return logits.
             communicate_logits=False,
             communicate_cache_hits=False,
-            verbose=True,
+            verbose=self.server_args.speculative_async_verbose,
         )
         config = DraftRunner.create_draft_config(config)
 

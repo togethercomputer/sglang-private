@@ -506,6 +506,7 @@ class ServerArgs:
     speculative_async_draft_temperature: Optional[float] = None
     speculative_async_remote_draft: bool = False
     speculative_async_port: int = 29600
+    speculative_async_verbose: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -2965,10 +2966,6 @@ class ServerArgs:
                 raise ValueError(
                     "Async speculative decoding requires --speculative-draft-model-path to be set."
                 )
-            if self.speculative_algorithm != "ASYNC_EAGLE3":
-                raise ValueError(
-                    "The only type of Eagle algorithm supported in async speculative decoding is Eagle3 for now."
-                )
 
             if self.page_size != 1:
                 logger.warning(
@@ -4548,6 +4545,8 @@ class ServerArgs:
                 "ASYNC_STANDALONE",
                 "ASYNC_EAGLE",
                 "ASYNC_EAGLE3",
+                "ASYNC_PHOENIX",
+                "ASYNC_PHOENIX2",
             ],
             help="Speculative algorithm.",
         )
@@ -4748,6 +4747,11 @@ class ServerArgs:
             default=ServerArgs.speculative_async_port,
             help="Fixed NCCL port for cross-node async speculative decoding. "
             "Both target and draft must use the same port.",
+        )
+        parser.add_argument(
+            "--speculative-async-verbose",
+            action="store_true",
+            help="Enable NCCL logging for async speculative decoding.",
         )
 
         # Expert parallelism
