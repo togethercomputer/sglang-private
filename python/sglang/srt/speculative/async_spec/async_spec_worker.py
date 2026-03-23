@@ -12,6 +12,7 @@ from ssd.engine.helpers.runner_helpers import (
 )
 from ssd.utils.misc import compress_neg_ones_and_zeros
 
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -94,14 +95,16 @@ class AsyncSpecWorker(SpecWorker):
         # K from the glue decode, MQ_LEN * K from the tree decode.
         self.num_tokens_for_async_draft_tree = K * (MQ_LEN + 1) + 1
         B = 1
-        eagle3 = self.speculative_algorithm.is_eagle3()
-        phoenix = self.speculative_algorithm.is_phoenix()
-        if eagle3:
+        eagle = self.speculative_algorithm == SpeculativeAlgorithm.ASYNC_EAGLE
+        eagle3 = self.speculative_algorithm == SpeculativeAlgorithm.ASYNC_EAGLE3
+        phoenix_v1 = self.speculative_algorithm == SpeculativeAlgorithm.ASYNC_PHOENIX
+        phoenix_v2 = self.speculative_algorithm == SpeculativeAlgorithm.ASYNC_PHOENIX2
+        if eagle3 or phoenix_v2:
             eagle_act_dim = 3 * target_hidden_size
-        elif phoenix:
+        elif eagle or phoenix_v1:
             eagle_act_dim = target_hidden_size
         else:
-            eagle_act_dim = 0
+            raise ValueError(f"Unsupported speculative algorithm: {self.speculative_algorithm}")
 
         self._speculation_request = SpeculationRequest.prepare(
             batch_size=B,
