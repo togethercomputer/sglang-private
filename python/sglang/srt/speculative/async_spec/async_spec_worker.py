@@ -99,10 +99,13 @@ class AsyncSpecWorker(SpecWorker):
         eagle3 = self.speculative_algorithm == SpeculativeAlgorithm.ASYNC_EAGLE3
         phoenix_v1 = self.speculative_algorithm == SpeculativeAlgorithm.ASYNC_PHOENIX
         phoenix_v2 = self.speculative_algorithm == SpeculativeAlgorithm.ASYNC_PHOENIX2
+        standalone = self.speculative_algorithm == SpeculativeAlgorithm.ASYNC_STANDALONE
         if eagle3 or phoenix_v2:
             eagle_act_dim = 3 * target_hidden_size
         elif eagle or phoenix_v1:
             eagle_act_dim = target_hidden_size
+        elif standalone:
+            eagle_act_dim = 0
         else:
             raise ValueError(f"Unsupported speculative algorithm: {self.speculative_algorithm}")
 
@@ -181,12 +184,32 @@ class AsyncSpecWorker(SpecWorker):
             draft_input.hidden_states = logits_output.hidden_states
 
     def _prepare_for_extend(self, batch: ScheduleBatch):
-        pass
+        if batch.forward_mode.is_idle():
+            return
+
         if self.speculative_algorithm.is_eagle():
-            # Duplicate the first hidden state, and remove the last hidden state, so that the sequence length is the same as the input_ids.
-            batch.spec_info.hidden_states = torch.cat([
-                batch.spec_info.hidden_states[:1, :], batch.spec_info.hidden_states[:-1, :],
-            ], dim=0)
+            B = len(batch.seq_lens)
+            eagle_act_dim = batch.spec_info.hidden_states.shape[1]
+            if batch.spec_info.last_hidden_states is None or batch.spec_info.last_hidden_states.shape[0] != B:
+                batch.spec_info.last_hidden_states = torch.empty(
+                    B, eagle_act_dim, device=self.device, dtype=batch.spec_info.hidden_states.dtype,
+                )
+
+            assert len(batch.spec_info.verified_id) == B
+            assert batch.spec_info.hidden_states.shape[0] == sum(batch.extend_lens), (
+                f"hidden_states.shape[0]={batch.spec_info.hidden_states.shape[0]} != sum(extend_lens)={sum(batch.extend_lens)}"
+            )
+            # Duplicate the first hidden state (h0), and remove the last hidden state, so that the sequence
+            # length is the same as the input tokens (t0, t1, ...). So the inputs to the Eagle prefill are:
+            # [t0, h0], [t1, h0], [t2, h1], [t3, h2], [t4, h3], ...
+            pt = 0
+            for i, extend_len in enumerate(batch.extend_lens):
+                hidden_states = batch.spec_info.hidden_states[pt : pt + extend_len, :]
+                batch.spec_info.last_hidden_states[i, :] = hidden_states[-1, :]
+                batch.spec_info.hidden_states[pt : pt + extend_len, :] = torch.cat([
+                    hidden_states[:1, :], hidden_states[:-1, :],
+                ], dim=0)
+                pt += extend_len
 
     def _draft_extend_forward_pass(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         draft_block_table, max_blocks = self._get_draft_block_table(forward_batch)
@@ -256,7 +279,8 @@ class AsyncSpecWorker(SpecWorker):
 
         if self.speculative_algorithm.is_eagle():
             eagle_acts = forward_batch.spec_info.hidden_states
-            verified_id = forward_batch.spec_info.verified_id
+            accepted_token_ids = forward_batch.input_ids
+            last_hidden_states = forward_batch.spec_info.last_hidden_states
             seq_lens = forward_batch.seq_lens
             if isinstance(accept_length, int):
                 assert accept_length == -2
@@ -271,10 +295,10 @@ class AsyncSpecWorker(SpecWorker):
                 b = max(min(a + acc_len, eagle_acts.shape[0]), 0)
                 self._speculation_request.extend_counts[i] = 0 if is_first_decode else acc_len
                 if eagle_acts is not None:
-                    self._speculation_request.recovery_activations[i, :] = eagle_acts[b - 1, :]
+                    self._speculation_request.recovery_activations[i, :] = last_hidden_states[i, :]
                     if not is_first_decode and acc_len > 0:
                         self._speculation_request.extend_activations[i, :acc_len] = eagle_acts[a: b, :]
-                        self._speculation_request.extend_token_ids[i, :acc_len] = verified_id[a: b]
+                        self._speculation_request.extend_token_ids[i, :acc_len] = accepted_token_ids[a: b]
                         a += acc_len
 
         if NCCL_LOG:
@@ -348,3 +372,23 @@ class AsyncSpecWorker(SpecWorker):
             batch,
             self.speculative_num_steps,
         )
+        if self.speculative_algorithm.is_eagle() and not batch.forward_mode.is_idle():
+            # Extract the last target hidden state per request for recovery_activations.
+            # After prepare_extend_after_decode, batch.extend_lens[i] gives the number of
+            # hidden states for request i (accepted tokens + verified token).
+            # The last hidden state per request is the recovery activation.
+            B = len(batch.extend_lens)
+            hidden_states = batch.spec_info.hidden_states
+            assert hidden_states.shape[0] == sum(batch.extend_lens), (
+                f"hidden_states.shape[0]={hidden_states.shape[0]} != sum(extend_lens)={sum(batch.extend_lens)}"
+            )
+            eagle_act_dim = hidden_states.shape[1]
+            if batch.spec_info.last_hidden_states is None or batch.spec_info.last_hidden_states.shape[0] != B:
+                batch.spec_info.last_hidden_states = torch.empty(
+                    B, eagle_act_dim, device=self.device, dtype=hidden_states.dtype,
+                )
+            pt = 0
+            for i in range(B):
+                extend_len = batch.extend_lens[i]
+                batch.spec_info.last_hidden_states[i, :] = hidden_states[pt + extend_len - 1, :]
+                pt += extend_len
