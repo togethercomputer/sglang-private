@@ -141,15 +141,33 @@ class AsyncSpecWorker(SpecWorker):
         forward_batch: ForwardBatch,
     ) -> torch.tensor:
         r2t = forward_batch.req_to_token_pool.req_to_token
-        max_blocks = min(
+        page_size = self.server_args.page_size
+        max_tokens = min(
             forward_batch.seq_lens.max() + self.num_tokens_for_async_draft_tree,
             forward_batch.req_to_token_pool.req_to_token.shape[1],
         )
-        draft_block_table = torch.stack(
-            [r2t[idx, :max_blocks] for idx in forward_batch.req_pool_indices],
-            dim=0,
-        ).to(device=self.device, dtype=torch.int64)
-        return draft_block_table, max_blocks
+        if page_size == 1:
+            draft_block_table = torch.stack(
+                [r2t[idx, :max_tokens] for idx in forward_batch.req_pool_indices],
+                dim=0,
+            ).to(device=self.device, dtype=torch.int64)
+            return draft_block_table, max_tokens
+        else:
+            # Convert per-token indices to page-level block table.
+            # Sample req_to_token at stride intervals and divide by page_size.
+            pool_len = r2t.shape[1]
+            max_pages = (max_tokens + page_size - 1) // page_size
+            # Clamp strided indices to stay within req_to_token bounds.
+            strided_indices = torch.arange(
+                0, max_pages * page_size, page_size,
+                device=self.device,
+            ).clamp_(max=pool_len - 1)
+            per_token_indices = torch.stack(
+                [r2t[idx, strided_indices] for idx in forward_batch.req_pool_indices],
+                dim=0,
+            ).to(device=self.device, dtype=torch.int64)
+            draft_block_table = per_token_indices // page_size
+            return draft_block_table, max_pages
 
     def _init_model_runner(self):
         self._model_runner = ModelRunnerStub(

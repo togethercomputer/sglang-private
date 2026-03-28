@@ -2967,12 +2967,6 @@ class ServerArgs:
                     "Async speculative decoding requires --speculative-draft-model-path to be set."
                 )
 
-            if self.page_size != 1:
-                logger.warning(
-                    "Page size is reset to 1 for async speculative decoding."
-                )
-                self.page_size = 1
-
             self.disable_overlap_schedule = True
             self.enable_mixed_chunk = False
             self.enable_dp_attention = False

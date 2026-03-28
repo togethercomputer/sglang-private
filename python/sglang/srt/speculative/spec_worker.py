@@ -490,18 +490,17 @@ class SpecWorker(TpModelWorker):
                 backup_state=True,
             )
         else:
-            if self.speculative_algorithm.is_async():
-                raise NotImplementedError("Async spec is not supported for page size > 1")
             if self.topk == 1:
+                alloc_len_for_speculation = self._get_alloc_len_for_speculation()
                 prefix_lens, seq_lens, last_loc = get_last_loc_large_page_size_top_k_1(
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
                     batch.seq_lens,
-                    self.speculative_num_steps,
+                    alloc_len_for_speculation,
                 )
                 prefix_lens_cpu = batch.seq_lens_cpu
-                seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
-                extend_num_tokens = num_seqs * self.speculative_num_steps
+                seq_lens_cpu = batch.seq_lens_cpu + alloc_len_for_speculation
+                extend_num_tokens = num_seqs * alloc_len_for_speculation
             else:
                 # In this case, the last partial page needs to be duplicated.
                 # KV cache layout in batch.req_to_token_pool.req_to_token:
