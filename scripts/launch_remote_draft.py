@@ -125,18 +125,24 @@ def parse_args():
         default=False,
         help="Enable verbose logging",
     )
-    # Eagle-specific options
+    # Eagle/Phoenix-specific options
     parser.add_argument(
         "--tokenizer-path",
         type=str,
         default=None,
-        help="Path to target model tokenizer (required for EAGLE variants)",
+        help="Path to target model tokenizer (required for EAGLE/Phoenix variants)",
     )
     parser.add_argument(
         "--d-model-target",
         type=int,
         default=None,
-        help="Target model hidden size (required for EAGLE variants)",
+        help="Target model hidden size (required for EAGLE/Phoenix variants)",
+    )
+    parser.add_argument(
+        "--use-phoenix",
+        action="store_true",
+        default=False,
+        help="Use Phoenix draft model architecture instead of EAGLE",
     )
     return parser.parse_args()
 
@@ -155,7 +161,8 @@ def main():
     from ssd.config import Config
     from ssd.engine.draft_runner import DraftRunner
 
-    use_eagle = args.tokenizer_path is not None
+    use_phoenix = args.use_phoenix
+    use_eagle = args.tokenizer_path is not None and not use_phoenix
 
     config = Config(
         draft=draft_model_path,
@@ -180,6 +187,7 @@ def main():
         communicate_logits=False,
         communicate_cache_hits=False,
         use_eagle=use_eagle,
+        use_phoenix=use_phoenix,
         enforce_eager=args.enforce_eager,
         verbose=args.verbose,
     )
@@ -191,7 +199,7 @@ def main():
     print(f"  Speculate K: {args.speculate_k}")
     print(f"  Fan-out: {args.fan_out}")
     print(f"  KV cache blocks: {args.kv_cache_size}")
-    print(f"  EAGLE: {use_eagle}")
+    print(f"  EAGLE: {use_eagle}, Phoenix: {use_phoenix}")
 
     # DraftRunner.__init__ will:
     # 1. Load the model
