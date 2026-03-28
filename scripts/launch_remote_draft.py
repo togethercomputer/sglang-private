@@ -201,6 +201,11 @@ def main():
     print(f"  KV cache blocks: {args.kv_cache_size}")
     print(f"  EAGLE: {use_eagle}, Phoenix: {use_phoenix}")
 
+    print(
+        f"Will load draft model, then wait for target server at "
+        f"{args.target_host}:{args.port} to form NCCL process group..."
+    )
+
     # DraftRunner.__init__ will:
     # 1. Load the model
     # 2. Connect to target's TCPStore via async_nccl_host:async_nccl_port
