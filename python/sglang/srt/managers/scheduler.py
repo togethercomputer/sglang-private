@@ -571,7 +571,7 @@ class Scheduler(
             self.draft_worker = None
             return
 
-        if self.spec_algorithm.is_async:
+        if self.spec_algorithm.is_async():
             # Async spec: draft runs on a dedicated GPU in a separate process
             self._init_async_spec_worker()
             return
