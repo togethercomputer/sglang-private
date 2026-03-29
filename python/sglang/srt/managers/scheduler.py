@@ -697,6 +697,11 @@ class Scheduler(
             # init_custom_process_group during its model load.
             device = torch.device(f"cuda:{self.gpu_id}")
             tcpstore_host = "0.0.0.0" if cross_node else "127.0.0.1"
+            draft_location = "remote node" if cross_node else f"local GPU {self.server_args.tp_size}"
+            logger.info(
+                f"Waiting for draft model on {draft_location} to connect "
+                f"(TCPStore on {tcpstore_host}:{async_spec_nccl_port})..."
+            )
             store = TCPStore(
                 host_name=tcpstore_host,
                 port=async_spec_nccl_port,

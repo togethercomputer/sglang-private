@@ -108,6 +108,12 @@ def parse_args():
         help="Enable JIT speculation on cache miss (must match target)",
     )
     parser.add_argument(
+        "--page-size",
+        type=int,
+        default=1,
+        help="KV cache block size in tokens (must match target's --page-size)",
+    )
+    parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
         default=0.8,
@@ -177,7 +183,7 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         tokenizer_path=args.tokenizer_path,
         d_model_target=args.d_model_target,
-        kvcache_block_size=1,
+        kvcache_block_size=args.page_size,
         num_kvcache_blocks=args.kv_cache_size,
         max_num_seqs=args.max_running_requests,
         max_model_len=args.max_model_len,
