@@ -659,6 +659,10 @@ class Req(ReqDllmMixin):
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
+        # Async speculation state
+        self.recovery_token_id: Optional[int] = None
+        self.last_spec_step_accepted_len: int = -1
+
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
