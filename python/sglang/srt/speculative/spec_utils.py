@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import logging
 import os
 import time
@@ -17,6 +18,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -25,6 +27,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_nccl_tokenizer = None
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -47,6 +50,42 @@ SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+
+
+def _ts():
+    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+
+def _get_nccl_tokenizer():
+    global _nccl_tokenizer
+    if _nccl_tokenizer is None:
+        try:
+            from transformers import AutoTokenizer
+            _nccl_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        except Exception as e:
+            print(f"[{_ts()}] [NCCL_LOG] Failed to load tokenizer: {e}", flush=True)
+            return None
+    return _nccl_tokenizer
+
+
+def _decode_ids(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return "<no tokenizer>"
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return tok.decode(ids)
+
+
+def _decode_id_list(ids_tensor):
+    tok = _get_nccl_tokenizer()
+    if tok is None:
+        return []
+    ids = ids_tensor.cpu().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    return [tok.decode([t]) for t in ids]
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
@@ -155,13 +194,16 @@ def assign_draft_cache_locs(
     page_size: tl.constexpr,
     bs_upper: tl.constexpr,
     iter_upper: tl.constexpr,
+    copy_len: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
 
     if page_size == 1 or topk == 1:
-        copy_len = topk * speculative_num_steps
-        out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
+        # copy_len is passed by the caller (_get_alloc_len_for_speculation).
+        # For async spec this is num_tokens_for_async_draft_tree; otherwise
+        # it equals topk * speculative_num_steps.
+        out_cache_ptr = out_cache_loc + pid * copy_len
     else:
         bs_offset = tl.arange(0, bs_upper)
         copy_len = tl.load(extend_lens + pid)
@@ -722,6 +764,15 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
+
+
+def detect_nan(logits_output: LogitsProcessorOutput):
+    if logits_output is None:
+        return
+    logits = logits_output.next_token_logits
+    if torch.any(torch.isnan(logits)):
+        logger.error("Detected errors during sampling! NaN in the logits.")
+        raise ValueError("Detected errors during sampling! NaN in the logits.")
 
 
 def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):

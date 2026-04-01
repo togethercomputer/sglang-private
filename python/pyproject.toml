@@ -77,6 +77,7 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.1.27",
   "smg-grpc-servicer>=0.5.0",
+  "ssd @ git+https://github.com/togethercomputer/ssd.git@avner/sglang-fa4-phnx",
 ]
 
 [[tool.uv.index]]

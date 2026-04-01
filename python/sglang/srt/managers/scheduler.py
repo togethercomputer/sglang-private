@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+from datetime import datetime
 import signal
 import sys
 import time
@@ -230,6 +231,11 @@ else:
     from torch.cuda import StreamContext as CudaStreamContext
 
 logger = logging.getLogger(__name__)
+
+
+def _ts():
+    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -565,6 +571,11 @@ class Scheduler(
             self.draft_worker = None
             return
 
+        if self.spec_algorithm.is_async():
+            # Async spec: draft runs on a dedicated GPU in a separate process
+            self._init_async_spec_worker()
+            return
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -588,6 +599,193 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+    def _init_async_spec_worker(self):
+        """Initialize the async spec worker with a dedicated draft GPU process."""
+        from ssd.config import Config
+        from ssd.engine.draft_runner import DraftRunner
+
+        from sglang.srt.speculative.async_spec.async_spec_worker import (
+            AsyncSpecWorker,
+        )
+        from sglang.srt.utils.common import init_custom_process_group
+
+        import torch.multiprocessing as mp
+        from torch.distributed import TCPStore
+
+        cross_node = self.server_args.speculative_async_remote_draft
+
+        # TODO: A bit confusing that is_eagle() here includes Phoenix as well.
+        eagle_or_phoenix = self.spec_algorithm.is_eagle()
+        kv_cache_size = self.tp_worker.model_runner.token_to_kv_pool.size
+        print(f"[{_ts()}] token_to_kv_pool.size={kv_cache_size}")
+        print(f"[{_ts()}] req_to_token_pool.max_context_len={self.tp_worker.model_runner.req_to_token_pool.max_context_len}")
+
+        if not os.path.exists(self.server_args.speculative_draft_model_path):
+            # Resolve HuggingFace model ID to local cache path
+            from huggingface_hub import snapshot_download
+            self.server_args.speculative_draft_model_path = snapshot_download(self.server_args.speculative_draft_model_path)
+            print(f"[{_ts()}] Downloaded draft model to {self.server_args.speculative_draft_model_path}")
+
+        async_spec_nccl_port = self.server_args.speculative_async_port
+        if async_spec_nccl_port is None:
+            raise ValueError(
+                "--speculative-async-port must be specified for cross-node async spec "
+                "(both target and draft nodes must use the same port)"
+            )
+
+        if cross_node:
+            # Cross-node mode: draft runner launched independently on remote node.
+            # Use user-specified or auto-selected NCCL port.
+            logger.info(
+                f"Cross-node async spec: NCCL port={async_spec_nccl_port}, "
+                f"draft runner expected on remote node"
+            )
+        else:
+            # Local mode: draft runner spawned on same node.
+            draft_gpu_id = self.server_args.tp_size
+            logger.info(
+                f"Spawning async draft runner on GPU {draft_gpu_id}, "
+                f"NCCL port {async_spec_nccl_port}"
+            )
+
+        target_hidden_size = self.model_config.hidden_size if eagle_or_phoenix else 0
+        config = Config(
+            draft=self.server_args.speculative_draft_model_path,  # TODO: accept revision
+            model=self.server_args.model_path,
+            num_gpus=2,  # Total dist world size: target (rank 0) + draft (rank 1)
+            speculate=True,
+            speculate_k=self.server_args.speculative_num_steps,
+            draft_async=True,
+            async_fan_out=self.server_args.speculative_async_fan_out,
+            fan_out_list=self.server_args.speculative_async_fan_out_list,
+            fan_out_list_miss=self.server_args.speculative_async_fan_out_list_miss,
+            gpu_memory_utilization=0.8,
+            tokenizer_path=self.server_args.tokenizer_path if eagle_or_phoenix else None,
+            d_model_target=target_hidden_size,
+            use_eagle=eagle_or_phoenix and not self.spec_algorithm.is_phoenix(),
+            use_phoenix=self.spec_algorithm.is_phoenix(),
+            kvcache_block_size=self.server_args.page_size,
+            num_kvcache_blocks=kv_cache_size // self.server_args.page_size,
+            max_num_seqs=self.server_args.max_running_requests or 64,
+            max_model_len=self.server_args.context_length,
+            jit_speculate=self.server_args.speculative_async_jit_speculate,
+            max_steps=self.server_args.max_total_tokens,
+            async_nccl_port=async_spec_nccl_port,
+            # Currently always do greedy drafting in async spec, no need for draft to return logits.
+            communicate_logits=False,
+            communicate_cache_hits=False,
+            verbose=self.server_args.speculative_async_verbose,
+        )
+        config = DraftRunner.create_draft_config(config)
+
+        async_pg = None
+        if self.tp_rank == 0:
+            if not cross_node:
+                # Local mode: spawn draft runner process on same node.
+                ctx = mp.get_context("spawn")
+                init_q = ctx.Queue()
+                self.draft_process = ctx.Process(
+                    target=_run_draft_runner,
+                    args=(config, draft_gpu_id, init_q),
+                    daemon=True,
+                )
+                self.draft_process.start()
+
+            # Create custom process group (rank=0, target side).
+            # This blocks until the DraftRunner (rank=1) also calls
+            # init_custom_process_group during its model load.
+            device = torch.device(f"cuda:{self.gpu_id}")
+            tcpstore_host = "0.0.0.0" if cross_node else "127.0.0.1"
+            draft_location = "remote node" if cross_node else f"local GPU {self.server_args.tp_size}"
+            logger.info(
+                f"Waiting for draft model on {draft_location} to connect "
+                f"(TCPStore on {tcpstore_host}:{async_spec_nccl_port})..."
+            )
+            store = TCPStore(
+                host_name=tcpstore_host,
+                port=async_spec_nccl_port,
+                world_size=2,
+                is_master=True,
+            )
+            with torch.cuda.device(device):
+                async_pg = init_custom_process_group(
+                    backend="nccl",
+                    store=store,
+                    world_size=2,
+                    rank=0,
+                    group_name="async_spec",
+                )
+
+            # Send kv_cache_size to draft so it allocates matching KV cache blocks.
+            # This must happen right after NCCL group formation and before the draft
+            # allocates its KV cache.
+            kv_buf = torch.tensor([kv_cache_size], dtype=torch.int64, device=device)
+            torch.distributed.send(kv_buf, dst=1, group=async_pg)
+            logger.info(f"Sent kv_cache_size={kv_cache_size} to draft via NCCL")
+
+            if cross_node:
+                # Cross-node mode: receive num_kvcache_blocks via NCCL
+                # (draft sends this after full init instead of using mp.Queue).
+                logger.info("Waiting for remote draft runner to signal readiness via NCCL...")
+                ready_buf = torch.empty(1, dtype=torch.int64, device=device)
+                torch.distributed.recv(ready_buf, src=1, group=async_pg)
+                num_kvcache_blocks = ready_buf.item()
+                logger.info(
+                    f"Remote draft runner ready, num_kvcache_blocks={num_kvcache_blocks}"
+                )
+            else:
+                # Local mode: wait for draft runner via mp.Queue.
+                logger.info("Waiting for async draft runner to initialize...")
+                result = None
+                try:
+                    result = init_q.get(timeout=180)
+                except Exception:
+                    alive = self.draft_process.is_alive()
+                    exitcode = self.draft_process.exitcode
+                    raise RuntimeError(
+                        f"Timed out waiting for async draft runner to initialize. "
+                        f"Draft process alive={alive}, exitcode={exitcode}"
+                    )
+                init_q.close()
+
+                if isinstance(result, dict) and "error" in result:
+                    raise RuntimeError(
+                        f"Async draft runner failed to start:\n{result['error']}"
+                    )
+                num_kvcache_blocks = result
+
+            draft_location = "remote node" if cross_node else f"GPU {draft_gpu_id}"
+            logger.info(
+                f"Async draft runner ready on {draft_location}, "
+                f"num_kvcache_blocks={num_kvcache_blocks}"
+            )
+            if num_kvcache_blocks != kv_cache_size:
+                logger.warning(
+                    f"Target process has KV cache of size {kv_cache_size} blocks, "
+                    f"but draft process has {num_kvcache_blocks} blocks"
+                )
+        else:
+            logger.info(f"TP rank {self.tp_rank}: skipping draft runner spawn (handled by rank 0)")
+
+        # Create AsyncSpecWorker on all ranks.
+        # Only rank 0 has async_pg != None; other ranks will broadcast from rank 0.
+        self.draft_worker = AsyncSpecWorker(
+            server_args=self.server_args,
+            target_hidden_size=target_hidden_size,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            dp_rank=self.dp_rank,
+            moe_ep_rank=self.moe_ep_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_dp_rank=self.moe_dp_rank,
+            nccl_port=async_spec_nccl_port,
+            target_worker=self.tp_worker,
+            async_process_group=async_pg,
+            # For this custom process group, rank 1 is the draft runner, rank 0 is the target.
+            # These ranks are independent of the TP ranks / GPU ids.
+            async_rank=1,
+        )
 
     def init_model_worker(self):
         self.init_tp_model_worker()
@@ -3280,6 +3478,18 @@ class SenderWrapper:
             output.http_worker_ipc = recv_obj.http_worker_ipc
 
         self.socket.send_pyobj(output)
+
+
+def _run_draft_runner(cfg, gpu_id, q):
+    """Wrapper to catch and report errors from the draft runner process."""
+    try:
+        from ssd.engine.draft_runner import DraftRunner
+
+        DraftRunner(cfg, gpu_id, q)
+    except Exception:
+        import traceback
+
+        q.put({"error": traceback.format_exc()})
 
 
 def dispatch_event_loop(scheduler: Scheduler):

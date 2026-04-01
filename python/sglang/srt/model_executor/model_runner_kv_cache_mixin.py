@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
@@ -378,7 +379,10 @@ class ModelRunnerKVCacheMixin:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
             extra_max_context_len = 4
             if self.server_args.speculative_num_draft_tokens is not None:
-                extra_max_context_len += self.server_args.speculative_num_draft_tokens
+                if SpeculativeAlgorithm.from_string(self.server_args.speculative_algorithm).is_async():
+                    extra_max_context_len += sum(self.server_args.speculative_async_fan_out_list)
+                else:
+                    extra_max_context_len += self.server_args.speculative_num_draft_tokens
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (

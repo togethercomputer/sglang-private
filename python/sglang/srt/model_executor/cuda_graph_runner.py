@@ -549,6 +549,7 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.is_async()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
