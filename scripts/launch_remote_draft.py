@@ -207,9 +207,13 @@ def main():
     print(f"  KV cache blocks: {args.kv_cache_size}")
     print(f"  EAGLE: {use_eagle}, Phoenix: {use_phoenix}")
 
+    _banner = "=" * 80
     print(
-        f"Will load draft model, then wait for target server at "
-        f"{args.target_host}:{args.port} to form NCCL process group..."
+        f"\n{_banner}\n"
+        f">>> Will load draft model, then WAIT for target server at "
+        f"{args.target_host}:{args.port} to form NCCL process group (timeout=20min)...\n"
+        f"{_banner}\n",
+        flush=True,
     )
 
     # DraftRunner.__init__ will:
