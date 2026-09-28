@@ -58,7 +58,6 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -2250,36 +2249,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.selector is None and self.lilicorr is None and not self._is_domino
         )
         if base_dflash:
-            sampled_rows = sampling_info.top_ks.view(-1) > 1
-            filtered_top_k = sampled_rows & (
-                sampling_info.top_ks.view(-1) != TOP_K_ALL
-            )
-            if sampling_info.need_top_p_sampling or bool(filtered_top_k.any().item()):
-                raise ValueError(
-                    "DFlash rejection sampling currently requires top_p=1 and "
-                    "unfiltered top-k on sampled requests."
-                )
             if sampling_info.need_min_p_sampling:
                 raise ValueError(
                     "DFlash rejection sampling does not support min-p sampling yet."
-                )
-            if batch.has_grammar:
-                raise ValueError(
-                    "DFlash rejection sampling does not support grammar-constrained proposals."
-                )
-
-            penalizer = sampling_info.penalizer_orchestrator
-            if penalizer is not None and penalizer.is_required:
-                raise ValueError(
-                    "DFlash rejection sampling does not support penalized proposals yet."
-                )
-            if sampling_info.logit_bias is not None:
-                raise ValueError(
-                    "DFlash rejection sampling does not support proposal logit bias yet."
-                )
-            if sampling_info.has_custom_logit_processor:
-                raise ValueError(
-                    "DFlash rejection sampling does not support custom proposal processors."
                 )
 
             target_model = self._target_worker.model_runner.model
