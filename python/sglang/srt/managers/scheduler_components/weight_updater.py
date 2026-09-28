@@ -127,9 +127,18 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
+            selector = "draft" if recv_req.update_draft_model else "all"
+            runners = self._select_runners(selector)
+            if recv_req.update_draft_model and not runners:
+                return UpdateWeightFromDiskReqOutput(
+                    success=False,
+                    message="No speculative draft worker is initialized.",
+                    num_paused_requests=0,
+                )
+
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            for role, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,
@@ -138,11 +147,13 @@ class SchedulerWeightUpdaterManager:
                 if not success:
                     break
                 target_updated |= role == "target"
-            # the served weights changed even if a draft runner failed afterwards
-            if target_updated:
+            # Target updates always invalidate cache. A successful draft-only
+            # update must also clear draft state before the next proposal.
+            if target_updated or (success and recv_req.update_draft_model):
                 self.flush_cache_after_weight_update(recv_req)
             if success:
-                self.record_weight_version_after_update(recv_req.weight_version)
+                if not recv_req.update_draft_model:
+                    self.record_weight_version_after_update(recv_req.weight_version)
             else:
                 logger.error(message)
             return UpdateWeightFromDiskReqOutput(

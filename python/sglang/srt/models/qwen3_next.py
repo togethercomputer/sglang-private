@@ -1015,6 +1015,7 @@ class Qwen3NextForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+        self.hot_token_id = None
 
         self.num_fused_shared_experts = self._get_num_fused_shared_experts()
         if self.num_fused_shared_experts > 1:
@@ -1128,6 +1129,13 @@ class Qwen3NextForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            if "d2t" in name:
+                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
+                continue
+
+            if "t2d" in name:
+                continue
+
             if is_mtp:
                 if "mtp" not in name:
                     continue

@@ -58,6 +58,9 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    # Spec training: lazy getter for the background-initialized Mooncake store.
+    get_eagle_mooncake_store: Callable[[], Any]
+
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
@@ -162,6 +165,12 @@ class SchedulerOutputStreamer:
             req.return_sampling_mask for req in reqs if req is not skip_req
         )
 
+        # Flush hidden-state writes before their Mooncake keys are streamed.
+        eagle_mooncake_store = self.get_eagle_mooncake_store()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        if attn_tp_rank == 0 and eagle_mooncake_store is not None:
+            eagle_mooncake_store.flush()
+
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
             return_hidden_states=return_hidden_states,
@@ -175,6 +184,8 @@ class SchedulerOutputStreamer:
             get_cached_tokens_details=self.get_cached_tokens_details,
             rust_server_mode=self.rust_server is not None,
             current_weight_version=get_serving().weight_version,
+            attn_tp_rank=attn_tp_rank,
+            eagle_mooncake_active=eagle_mooncake_store is not None,
         )
         for req in reqs:
             if req is skip_req:
@@ -324,6 +335,8 @@ class _GenerationStreamAccumulator:
     default_force_stream_interval: int
     get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
     current_weight_version: Optional[str]
+    attn_tp_rank: int = 0
+    eagle_mooncake_active: bool = False
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -378,6 +391,10 @@ class _GenerationStreamAccumulator:
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
     output_token_sampling_mask: Optional[list[Optional[SamplingMaskChunk]]] = None
+    spec_training_data_ids: Optional[list[Optional[str]]] = None
+    packed_loss_masks: Optional[list[Optional[str]]] = None
+    spec_training_mooncake_store_keys: Optional[list[list[str]]] = None
+
     # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
@@ -390,6 +407,11 @@ class _GenerationStreamAccumulator:
             self.routed_experts = []
         if self.return_indexer_topk:
             self.indexer_topk = []
+
+        if self.attn_tp_rank == 0:
+            self.spec_training_data_ids = []
+            self.packed_loss_masks = []
+            self.spec_training_mooncake_store_keys = []
 
         if self.return_logprob:
             self.input_token_logprobs_val = []
@@ -534,6 +556,13 @@ class _GenerationStreamAccumulator:
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
             self.spec_cap_lens_histogram.append(req.spec_cap_lens_histogram)
 
+        if self.spec_training_data_ids is not None:
+            self.spec_training_data_ids.append(req.spec_training_data_id)
+            self.packed_loss_masks.append(req.packed_loss_mask)
+            self.spec_training_mooncake_store_keys.append(
+                req.spec_training_mooncake_store_keys
+            )
+
         if self.return_logprob:
             if (
                 req.return_logprob
@@ -630,7 +659,12 @@ class _GenerationStreamAccumulator:
                 self.output_token_sampling_mask.append(None)
 
         if self.return_hidden_states:
-            if req.return_hidden_states:
+            uses_mooncake = (
+                self.attn_tp_rank == 0
+                and req.spec_training_data_id is not None
+                and self.eagle_mooncake_active
+            )
+            if req.return_hidden_states and not uses_mooncake:
                 if req.return_hidden_states == "last":
                     # Collection keeps this list bounded to the final valid
                     # accepted token, including speculative verify overshoot.
@@ -756,4 +790,15 @@ class _GenerationStreamAccumulator:
                 self.weight_versions if any(self.weight_versions) else None
             ),
             dp_ranks=dp_ranks,
+            spec_training_data_ids=(
+                self.spec_training_data_ids if self.spec_training_data_ids else None
+            ),
+            packed_loss_masks=(
+                self.packed_loss_masks if self.packed_loss_masks else None
+            ),
+            spec_training_mooncake_store_keys=(
+                self.spec_training_mooncake_store_keys
+                if self.spec_training_mooncake_store_keys
+                else None
+            ),
         )

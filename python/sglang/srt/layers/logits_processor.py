@@ -274,6 +274,10 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    ## Part 7: Spec training - skip sampling and use these fake token ids
+    skip_sampling_next_token_ids: Optional[torch.Tensor] = None
+    last_hidden_states: Optional[torch.Tensor] = None
+
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
             return
@@ -339,6 +343,9 @@ class LogitsMetadata:
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # For spec training
+    has_spec_training: bool = False
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
@@ -401,6 +408,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            has_spec_training=forward_batch.has_spec_training,
         )
 
     def compute_dp_attention_metadata(self):
@@ -559,6 +567,11 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.forward_mode.is_dllm_extend():
             return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
 
+        last_hidden_states = None
+        if logits_metadata.has_spec_training:
+            assert hidden_states_before_norm is None
+            last_hidden_states = hidden_states
+
         # Get the last hidden states and last logits for the next token prediction
         (
             pruned_states,
@@ -586,6 +599,47 @@ class LogitsProcessor(nn.Module):
         )
         del hidden_states
 
+        # TODO(ywang): Support finegrained control over requests instead of
+        # forcing all requests to be spec training requests
+
+        # For offline spec training (prefill-only, no decode), skip sampling
+        # and return fake EOS. In decode mode with EAGLE, the eagle_worker
+        # sets has_spec_training=False so this block is not triggered.
+        if (
+            logits_metadata.has_spec_training
+            and logits_metadata.forward_mode.is_extend()
+            and not logits_metadata.forward_mode.is_target_verify()
+        ):
+            if logits_metadata.extend_seq_lens is not None:
+                num_seqs = len(logits_metadata.extend_seq_lens)
+            elif input_ids is not None:
+                num_seqs = input_ids.shape[0]
+            else:
+                num_seqs = 1
+            eos_token_id = getattr(self.config, "eos_token_id", 0)
+            if isinstance(eos_token_id, list):
+                eos_token_id = eos_token_id[0]
+            if input_ids is not None:
+                device = input_ids.device
+            elif isinstance(last_hidden_states, torch.Tensor):
+                device = last_hidden_states.device
+            elif isinstance(last_hidden_states, tuple):
+                device = last_hidden_states[0].device
+            else:
+                device = lm_head.weight.device
+            fake_next_token_ids = torch.full(
+                (num_seqs,),
+                eos_token_id,
+                dtype=torch.long,
+                device=device,
+            )
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states,
+                skip_sampling_next_token_ids=fake_next_token_ids,
+            )
+
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
@@ -597,6 +651,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
@@ -614,6 +669,7 @@ class LogitsProcessor(nn.Module):
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            last_hidden_states=last_hidden_states,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
         logprobs_result.write_input_to(logits_output)
@@ -634,6 +690,7 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or logits_metadata.has_spec_training
         ):
             draft_extend_select_index = logits_metadata.draft_extend_select_index
             if draft_extend_select_index is not None:

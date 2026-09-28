@@ -20,6 +20,7 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 from array import array
 from collections import deque
@@ -367,6 +368,13 @@ from sglang.srt.utils.weight_versions import (
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+try:
+    from torchspec.config.mooncake_config import MooncakeConfig
+    from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+except ImportError:
+    EagleMooncakeStore = None
+    MooncakeConfig = None
+
 if is_mps():
     CudaStreamContext = nullcontext
     from sglang.srt.hardware_backend.mlx.scheduler_mixin import SchedulerMlxOverlapMixin
@@ -553,6 +561,24 @@ class Scheduler(
         # so patching them afterwards is a no-op.
         maybe_revert_pr_fix()
 
+        # Start mooncake store init in background (overlaps with model loading)
+        self.mooncake_init_thread = None
+        self.mooncake_init_error = None
+        self.eagle_mooncake_store = None
+        if self.server_args.enable_spec_training_mooncake and self.ps.attn_tp_rank == 0:
+            mooncake_device = torch.device(f"cuda:{self.ps.gpu_id}")
+
+            def init_mooncake() -> None:
+                try:
+                    self.init_eagle_mooncake_store(device=mooncake_device)
+                except Exception as e:
+                    self.mooncake_init_error = e
+
+            self.mooncake_init_thread = threading.Thread(
+                target=init_mooncake, daemon=True
+            )
+            self.mooncake_init_thread.start()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -713,6 +739,12 @@ class Scheduler(
         self.init_batch_result_processor()
 
         self.init_rank_consensus_checker()
+
+        # Wait for background mooncake store init to complete
+        if self.mooncake_init_thread is not None:
+            self.mooncake_init_thread.join()
+            if self.mooncake_init_error is not None:
+                raise self.mooncake_init_error
 
         self.is_initializing = False
         self.init_startup_timing_summary()
@@ -1301,6 +1333,21 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+
+    def init_eagle_mooncake_store(self, device=None):
+        if self.server_args.enable_spec_training_mooncake:
+            if EagleMooncakeStore is None or MooncakeConfig is None:
+                logger.warning(
+                    "torchspec.mooncake not found. Spec training mooncake store disabled."
+                )
+                return
+
+            config = MooncakeConfig.from_env()
+            store = EagleMooncakeStore(config)
+            store.setup(device=device or self.device)
+            store.warmup_rdma()
+            self.eagle_mooncake_store = store
+            logger.info("EagleMooncakeStore initialized for spec training")
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -2470,6 +2517,7 @@ class Scheduler(
                 self.enable_hicache_storage or self.enable_lmcache
             ),
             rust_server=self.rust_server,
+            get_eagle_mooncake_store=lambda: self.eagle_mooncake_store,
         )
 
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
@@ -2510,6 +2558,8 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+            attn_tp_rank=self.ps.attn_tp_rank,
+            get_eagle_mooncake_store=lambda: self.eagle_mooncake_store,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2817,6 +2867,8 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
                 token_indices_to_pool=recv_req.token_indices_to_pool,
+                spec_training_data_id=recv_req.spec_training_data_id,
+                packed_loss_mask=recv_req.packed_loss_mask,
             )
             req.tokenizer = self.tokenizer
 
@@ -4449,7 +4501,10 @@ class Scheduler(
                                 # overlaps.
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
+                                    return_hidden_states=(
+                                        batch.return_hidden_states
+                                        and batch.spec_training_info is None
+                                    ),
                                 )
                             else:
                                 # Result D2H on copy_stream overlaps the next forward
@@ -4459,7 +4514,10 @@ class Scheduler(
                                 with self.copy_stream_ctx:
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
-                                        return_hidden_states=batch.return_hidden_states,
+                                        return_hidden_states=(
+                                            batch.return_hidden_states
+                                            and batch.spec_training_info is None
+                                        ),
                                     )
                         else:
                             batch_result.future_indices = future_indices
@@ -4577,7 +4635,10 @@ class Scheduler(
                     ):
                         batch_result.copy_to_cpu(
                             return_logprob=batch.return_logprob,
-                            return_hidden_states=batch.return_hidden_states,
+                            return_hidden_states=(
+                                batch.return_hidden_states
+                                and batch.spec_training_info is None
+                            ),
                         )
             else:
                 kwargs = (
@@ -4748,7 +4809,10 @@ class Scheduler(
         with self.copy_stream_ctx:
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
-                return_hidden_states=cur_batch.return_hidden_states,
+                return_hidden_states=(
+                    cur_batch.return_hidden_states
+                    and cur_batch.spec_training_info is None
+                ),
             )
 
         # Release the closure and large GPU tensors that are no longer needed.

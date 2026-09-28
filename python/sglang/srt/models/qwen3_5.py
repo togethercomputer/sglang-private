@@ -1838,7 +1838,14 @@ class Qwen3_5ForCausalLM(nn.Module):
                     forward_batch=forward_batch,
                     captured_last_layer_outputs=(
                         aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
+                        # Honor both capture conventions: the per-layer flag set by
+                        # set_dflash_layers_to_capture, and the layers_to_capture list
+                        # set directly by the Qwen3VL wrapper's set_eagle3_layers_to_capture
+                        # (which never marks the per-layer flag on this hybrid model).
+                        if (
+                            getattr(layer, "_is_layer_to_capture", False)
+                            or layer_idx in self.layers_to_capture
+                        )
                         else None
                     ),
                 )

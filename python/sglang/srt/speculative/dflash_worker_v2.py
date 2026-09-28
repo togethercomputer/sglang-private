@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import logging
 import math
 import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import msgspec
 
 import torch
 import torch.distributed as dist
@@ -15,11 +19,18 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_draft_block_unchecked,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+    SoftmaxTemp,
     accept_sampling,
+)
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    SampleStepTokens,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -47,6 +58,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -105,6 +117,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+
+DENSE_HEAD_DTYPES: tuple[torch.dtype, ...] = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+)
+
+
+class DFlashDraftProposal(msgspec.Struct, frozen=True):
+    tokens: torch.Tensor
+    logits: torch.Tensor
+    greedy_mask: torch.Tensor
+    temperatures: torch.Tensor
 
 
 def _get_fused_kv_materialize_helper():
@@ -2125,6 +2150,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         candidates: torch.Tensor,
         next_token_logits: torch.Tensor,
+        dense_proposal: Optional[DFlashDraftProposal],
         sampling_info,
         draft_input,
         prefix_lens: torch.Tensor,
@@ -2132,7 +2158,19 @@ class DFlashWorkerV2(BaseSpecWorker):
     ):
         new_seq_lens = None
         target_predict = None
-        if self._selector_sample is not None:
+        if dense_proposal is not None:
+            assert sampling_info is not None
+            accept_len, bonus = self.accept_rejection_sampled_draft(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                proposal=dense_proposal,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        elif self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
@@ -2208,6 +2246,61 @@ class DFlashWorkerV2(BaseSpecWorker):
         if sampling_info is None or sampling_info.is_all_greedy:
             return
 
+        base_dflash = (
+            self.selector is None and self.lilicorr is None and not self._is_domino
+        )
+        if base_dflash:
+            sampled_rows = sampling_info.top_ks.view(-1) > 1
+            filtered_top_k = sampled_rows & (
+                sampling_info.top_ks.view(-1) != TOP_K_ALL
+            )
+            if sampling_info.need_top_p_sampling or bool(filtered_top_k.any().item()):
+                raise ValueError(
+                    "DFlash rejection sampling currently requires top_p=1 and "
+                    "unfiltered top-k on sampled requests."
+                )
+            if sampling_info.need_min_p_sampling:
+                raise ValueError(
+                    "DFlash rejection sampling does not support min-p sampling yet."
+                )
+            if batch.has_grammar:
+                raise ValueError(
+                    "DFlash rejection sampling does not support grammar-constrained proposals."
+                )
+
+            penalizer = sampling_info.penalizer_orchestrator
+            if penalizer is not None and penalizer.is_required:
+                raise ValueError(
+                    "DFlash rejection sampling does not support penalized proposals yet."
+                )
+            if sampling_info.logit_bias is not None:
+                raise ValueError(
+                    "DFlash rejection sampling does not support proposal logit bias yet."
+                )
+            if sampling_info.has_custom_logit_processor:
+                raise ValueError(
+                    "DFlash rejection sampling does not support custom proposal processors."
+                )
+
+            target_model = self._target_worker.model_runner.model
+            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+            weight = getattr(lm_head, "weight", None)
+            if weight is None or weight.dtype not in DENSE_HEAD_DTYPES:
+                raise RuntimeError(
+                    "DFlash rejection sampling requires a dense FP16, BF16, or FP32 LM head."
+                )
+
+            shard = getattr(lm_head, "shard_indices", None)
+            if shard is not None and int(shard.num_added_elements) != 0:
+                raise RuntimeError(
+                    "DFlash rejection sampling does not support added-vocabulary LM heads."
+                )
+            if shard is None and int(get_parallel().tp_group.world_size) != 1:
+                raise RuntimeError(
+                    "DFlash rejection sampling requires LM-head shard metadata for TP > 1."
+                )
+            return
+
         if self.selector is not None:
             if self._selector_sampling_enabled:
                 return
@@ -2252,6 +2345,212 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    @torch.inference_mode()
+    def sample_from_vocab_parallel_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head: torch.nn.Module,
+        batch_size: int,
+        sampling_info: SamplingBatchInfo,
+    ) -> DFlashDraftProposal:
+        """
+        Sample base-DFlash proposals and retain their exact dense distribution.
+        """
+        gamma = int(self.block_size) - 1
+        expected_rows = batch_size * gamma
+        if hidden_states.ndim != 2 or hidden_states.shape[0] != expected_rows:
+            raise ValueError(
+                "DFlash proposal hidden-state shape mismatch: "
+                f"expected rows={expected_rows}, got shape={tuple(hidden_states.shape)}."
+            )
+
+        weight = getattr(lm_head, "weight", None)
+        if weight is None or weight.dtype not in DENSE_HEAD_DTYPES:
+            raise RuntimeError(
+                "DFlash rejection sampling requires a dense FP16, BF16, or FP32 LM head."
+            )
+
+        shard = getattr(lm_head, "shard_indices", None)
+        if shard is not None and int(shard.num_added_elements) != 0:
+            raise RuntimeError(
+                "DFlash rejection sampling does not support added-vocabulary LM heads."
+            )
+
+        tp_group = get_parallel().tp_group
+        if shard is None and int(tp_group.world_size) != 1:
+            raise RuntimeError(
+                "DFlash rejection sampling requires LM-head shard metadata for TP > 1."
+            )
+
+        hidden = (
+            hidden_states
+            if hidden_states.dtype == weight.dtype
+            else hidden_states.to(weight.dtype)
+        )
+        local_logits = torch.matmul(hidden, weight.T)
+        full_logits = tp_group.all_gather(local_logits, dim=-1)
+        vocab_size = int(getattr(lm_head, "org_vocab_size", full_logits.shape[-1]))
+        logits = full_logits[:, :vocab_size].contiguous()
+
+        temperatures = (
+            sampling_info.temperatures.view(-1)[:batch_size]
+            .to(torch.float32)
+            .clamp_min(1e-5)
+        )
+        greedy_mask = resolve_greedy_mask(
+            bs=batch_size,
+            sampling_info=sampling_info,
+            device=logits.device,
+        ).contiguous()
+        row_temperatures = temperatures.repeat_interleave(gamma)
+        row_greedy_mask = greedy_mask.repeat_interleave(gamma)
+        exp_noise = torch.empty(
+            logits.shape,
+            dtype=torch.float32,
+            device=logits.device,
+        ).exponential_(1)
+        tokens = SampleStepTokens.execute(
+            step_logits=logits,
+            temperatures=row_temperatures,
+            greedy_mask=row_greedy_mask,
+            exp_noise=exp_noise,
+        ).view(batch_size, gamma)
+        self._tp_sync.sync(SpecTpSyncSite.DFLASH_DRAFT_SAMPLE, tokens)
+        return DFlashDraftProposal(
+            tokens=tokens,
+            logits=logits.view(batch_size, gamma, vocab_size),
+            greedy_mask=greedy_mask,
+            temperatures=temperatures,
+        )
+
+    @torch.inference_mode()
+    def accept_rejection_sampled_draft(
+        self,
+        *,
+        candidates: torch.Tensor,
+        next_token_logits: torch.Tensor,
+        proposal: DFlashDraftProposal,
+        sampling_info: SamplingBatchInfo,
+        draft_input: DFlashDraftInputV2,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Verify a sampled base-DFlash block against its exact proposal distribution.
+        """
+        batch_size, block_size = candidates.shape
+        gamma = block_size - 1
+        proposal_logits = proposal.logits.reshape(batch_size * gamma, -1)
+        if proposal_logits.shape[-1] != next_token_logits.shape[-1]:
+            raise RuntimeError(
+                "DFlash proposal and target vocabulary widths differ: "
+                f"proposal={proposal_logits.shape[-1]}, "
+                f"target={next_token_logits.shape[-1]}."
+            )
+
+        draft_probs = SoftmaxTemp.execute(
+            logits=proposal_logits,
+            temperatures=proposal.temperatures,
+            rows_per_request=gamma,
+        ).view(batch_size, gamma, -1)
+        sampled_len, sampled_bonus, unused_trim = accept_sampling(
+            candidates=candidates,
+            target_logits=next_token_logits,
+            draft_probs=draft_probs,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=block_size,
+            cutoff_verify_lens=None,
+        )
+        del unused_trim
+
+        if not sampling_info.is_any_greedy:
+            return sampled_len.to(torch.int32), sampled_bonus.to(torch.int64)
+
+        target_predict = torch.argmax(next_token_logits, dim=-1).view(
+            batch_size,
+            block_size,
+        )
+        greedy_len, greedy_bonus = compute_dflash_correct_drafts_and_bonus(
+            candidates=candidates,
+            target_predict=target_predict,
+        )
+        accept_len = torch.where(proposal.greedy_mask, greedy_len, sampled_len)
+        bonus = torch.where(proposal.greedy_mask, greedy_bonus, sampled_bonus)
+        return accept_len.to(torch.int32), bonus.to(torch.int64)
+
+    def capture_verifier_opd_prefill(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        next_token_ids: torch.Tensor,
+    ) -> None:
+        """Save prompt features and target-sampled anchors for verifier OPD."""
+        training = batch.spec_training_info
+        if training is None or get_parallel().attn_tp_rank != 0:
+            return
+        if logits_output.hidden_states is None:
+            raise RuntimeError("Verifier OPD prefill returned no target features.")
+
+        offset = 0
+        for index, (req, extend_len, prefix_len) in enumerate(
+            zip(batch.reqs, batch.extend_lens, batch.prefix_lens)
+        ):
+            end = offset + int(extend_len)
+            if training.has_request(req.rid):
+                if int(prefix_len) != 0:
+                    raise RuntimeError(
+                        "Verifier OPD requires disable_radix_cache=True so the full "
+                        "prompt feature stream is available."
+                    )
+                req.verifier_opd_context_hidden_states = (
+                    logits_output.hidden_states[offset:end].clone()
+                )
+                req.verifier_opd_anchor_token_id = next_token_ids[index : index + 1].clone()
+            offset = end
+
+        if offset != logits_output.hidden_states.shape[0]:
+            raise RuntimeError("Verifier OPD prefill feature rows do not match extend lengths.")
+
+    def capture_verifier_opd_grade(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        batch_size: int,
+        block_size: int,
+    ) -> None:
+        """Save target grades for the actual DFlash proposal block."""
+        training = batch.spec_training_info
+        if training is None or get_parallel().attn_tp_rank != 0:
+            return
+        if logits_output.last_hidden_states is None:
+            raise RuntimeError("Verifier OPD requires final target verification states.")
+        if logits_output.hidden_states is None:
+            raise RuntimeError("Verifier OPD requires auxiliary target verification states.")
+
+        expected_rows = batch_size * block_size
+        if logits_output.hidden_states.shape[0] != expected_rows:
+            raise RuntimeError("Verifier OPD auxiliary rows do not match the verify block.")
+        if logits_output.last_hidden_states.shape[0] != expected_rows:
+            raise RuntimeError("Verifier OPD final rows do not match the verify block.")
+
+        verifier_hidden = logits_output.hidden_states.reshape(batch_size, block_size, -1)
+        verifier_target = logits_output.last_hidden_states.reshape(batch_size, block_size, -1)
+        for index, req in enumerate(batch.reqs):
+            if not training.has_request(req.rid) or req.verifier_opd_stored:
+                continue
+
+            context_hidden = req.verifier_opd_context_hidden_states
+            if context_hidden is None:
+                raise RuntimeError("Verifier OPD verification has no captured context features.")
+            req.verifier_opd_hidden_states = torch.cat(
+                (context_hidden, verifier_hidden[index, :1].clone()),
+                dim=0,
+            )
+            req.verifier_opd_target = verifier_target[index, : block_size - 1].clone()
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -2263,11 +2562,19 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
-            batch_output = self.target_worker.forward_batch_generation(
-                batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-            )
+            training = batch.spec_training_info
+            verifier_opd = get_spec().spec_training_verifier_opd and training is not None
+            if verifier_opd:
+                batch.spec_training_info = None
+
+            try:
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+            finally:
+                batch.spec_training_info = training
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -2298,6 +2605,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
                     "but got None."
+                )
+
+            if verifier_opd:
+                self.capture_verifier_opd_prefill(
+                    batch=batch,
+                    logits_output=logits_output,
+                    next_token_ids=next_token_ids,
                 )
 
             # Materialize prompt tokens into the draft KV cache immediately. This is required
@@ -2574,8 +2888,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
+        dense_proposal: Optional[DFlashDraftProposal] = None
 
-        if (
+        base_sampling = (
+            self.selector is None
+            and self.lilicorr is None
+            and not self._is_domino
+            and not _is_all_greedy(batch.sampling_info)
+        )
+        if base_sampling:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFlash draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            dense_proposal = self.sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1,
+                    draft_hidden.shape[-1],
+                ),
+                lm_head=lm_head,
+                batch_size=bs,
+                sampling_info=batch.sampling_info,
+            )
+            draft_next = dense_proposal.tokens
+        elif (
             self._is_domino
             and self._draft_sampler is not None
             and draft_out.can_run_graph
@@ -2743,6 +3079,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+        verifier_opd = (
+            get_spec().spec_training_verifier_opd
+            and batch.spec_training_info is not None
+        )
+        verify_forward_batch.has_spec_training = verifier_opd
 
         # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
         # counts while a graph-replaying rank assumes the padded bucket, so
@@ -2769,6 +3110,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+
+        if verifier_opd:
+            self.capture_verifier_opd_grade(
+                batch=batch,
+                logits_output=logits_output,
+                batch_size=bs,
+                block_size=block_size,
+            )
 
         grammar_mask = None
         if batch.has_grammar:
@@ -2802,6 +3151,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
+            dense_proposal=dense_proposal,
             sampling_info=sampling_info,
             draft_input=draft_input,
             prefix_lens=prefix_lens,

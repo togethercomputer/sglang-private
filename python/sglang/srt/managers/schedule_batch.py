@@ -143,6 +143,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_training_info import SpecTrainingInfo
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -1048,6 +1049,8 @@ class Req(ReqDllmMixin):
         token_indices_to_pool: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        spec_training_data_id: Optional[str] = None,
+        packed_loss_mask: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -1095,6 +1098,16 @@ class Req(ReqDllmMixin):
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+
+        # Spec training fields
+        self.spec_training_data_id = spec_training_data_id
+        self.packed_loss_mask = packed_loss_mask
+        self.spec_training_mooncake_store_keys: List[str] = []
+        self.verifier_opd_context_hidden_states = None
+        self.verifier_opd_anchor_token_id = None
+        self.verifier_opd_hidden_states = None
+        self.verifier_opd_target = None
+        self.verifier_opd_stored = False
 
         # Require reasoning for the request
         self.require_reasoning = require_reasoning
@@ -2539,6 +2552,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
 
+    # Spec training
+    spec_training_info: Optional[SpecTrainingInfo] = None
+
     @classmethod
     def init_new(
         cls,
@@ -2555,6 +2571,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return_logprob = any(req.return_logprob for req in reqs)
 
         return_hidden_states_mode = get_batch_return_hidden_states_mode(reqs)
+
+        spec_training_info = SpecTrainingInfo()
+        for req in reqs:
+            if req.spec_training_data_id is not None:
+                spec_training_info.add_request(
+                    rid=req.rid,
+                    data_id=req.spec_training_data_id,
+                    packed_loss_mask=req.packed_loss_mask,
+                )
 
         batch = cls(
             reqs=reqs,
@@ -2576,6 +2601,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,
+            spec_training_info=(
+                spec_training_info if not spec_training_info.is_empty() else None
+            ),
         )
         return batch
 
@@ -3733,6 +3761,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices_cpu=keep_indices,
             )
 
+        if self.spec_training_info is not None:
+            kept_rids = {req.rid for req in self.reqs}
+            rids_to_remove = [
+                rid for rid in self.spec_training_info.data_ids if rid not in kept_rids
+            ]
+            for rid in rids_to_remove:
+                self.spec_training_info.remove_request(rid)
+            if self.spec_training_info.is_empty():
+                self.spec_training_info = None
+
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
         strip_beam_tail(other)
@@ -3803,6 +3841,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+        if self.spec_training_info is not None or other.spec_training_info is not None:
+            if self.spec_training_info is None:
+                self.spec_training_info = SpecTrainingInfo()
+            if other.spec_training_info is not None:
+                self.spec_training_info.data_ids.update(
+                    other.spec_training_info.data_ids
+                )
+                self.spec_training_info.packed_loss_masks.update(
+                    other.spec_training_info.packed_loss_masks
+                )
+                self.spec_training_info.mooncake_store_keys.update(
+                    other.spec_training_info.mooncake_store_keys
+                )
+
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list as a defensive snapshot. filter_batch and
@@ -3855,6 +3907,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             after_idle_gap=self.after_idle_gap,
             split_prefill_start=self.split_prefill_start,
             extend_num_tokens=self.extend_num_tokens,
+            spec_training_info=self.spec_training_info,
         )
 
     def _swa_eviction_trigger(self, sliding_window_size: int, eviction_interval: int):

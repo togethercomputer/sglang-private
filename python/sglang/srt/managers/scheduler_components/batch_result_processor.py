@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
+import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     List,
     Optional,
@@ -42,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
+    get_spec,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
@@ -112,6 +116,10 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    # Spec training: attn TP rank + lazy getter for the (background-initialized)
+    # EagleMooncakeStore living on the Scheduler.
+    attn_tp_rank: int
+    get_eagle_mooncake_store: Callable[[], Any]
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -318,12 +326,13 @@ class SchedulerBatchResultProcessor:
                         status=status
                     )
                 if (
-                    batch.return_hidden_states
+                    (batch.return_hidden_states or batch.spec_training_info is not None)
                     and logits_output.hidden_states is not None
                 ):
                     assert extend_input_len_per_req is not None
                     hidden_state_offset = self._append_prefill_hidden_states(
                         req=req,
+                        batch=batch,
                         logits_output=logits_output,
                         hidden_state_offset=hidden_state_offset,
                         capture_hidden_mode=prefill_hidden_capture_mode,
@@ -621,6 +630,7 @@ class SchedulerBatchResultProcessor:
         self,
         *,
         req: Req,
+        batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         hidden_state_offset: int,
         capture_hidden_mode: CaptureHiddenMode,
@@ -630,17 +640,39 @@ class SchedulerBatchResultProcessor:
         if capture_hidden_mode.is_full():
             start = hidden_state_offset
             hidden_state_offset += extend_input_len
-            if not store or not req.return_hidden_states:
+            if not store:
                 return hidden_state_offset
 
             req_hidden_states = logits_output.hidden_states[start:hidden_state_offset]
-            if req.return_hidden_states is True:
+            is_spec_training = (
+                batch.spec_training_info is not None
+                and batch.spec_training_info.has_request(req.rid)
+            )
+            if is_spec_training:
+                if self.attn_tp_rank != 0 or get_spec().spec_training_verifier_opd:
+                    return hidden_state_offset
+                if self.get_eagle_mooncake_store() is None:
+                    raise RuntimeError("Spec training requires the Mooncake training store.")
+                self.send_hidden_states_to_mooncake(
+                    req=req,
+                    batch=batch,
+                    hidden_states=req_hidden_states,
+                    logits_output=logits_output,
+                    hidden_state_offset=start,
+                )
+            elif req.return_hidden_states is True:
                 req.hidden_states.append(req_hidden_states.cpu().clone().tolist())
             elif req.return_hidden_states == "last":
                 req.hidden_states.append(req_hidden_states[-1].cpu().tolist())
         elif capture_hidden_mode.is_last():
             index = hidden_state_offset
             hidden_state_offset += 1
+            is_spec_training = (
+                batch.spec_training_info is not None
+                and batch.spec_training_info.has_request(req.rid)
+            )
+            if store and is_spec_training:
+                raise RuntimeError("Spec training requires full hidden-state capture.")
             if store and req.return_hidden_states:
                 req.hidden_states.append(
                     logits_output.hidden_states[index].cpu().tolist()
@@ -650,6 +682,129 @@ class SchedulerBatchResultProcessor:
                 f"Unexpected hidden states capture mode: {capture_hidden_mode}"
             )
         return hidden_state_offset
+
+    def put_spec_training_mooncake(
+        self,
+        *,
+        key: str,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        last_hidden_states: Optional[torch.Tensor],
+        target: Optional[torch.Tensor] = None,
+    ) -> None:
+        store = self.get_eagle_mooncake_store()
+        if os.getenv("TORCHSPEC_USP_SHARDED_MOONCAKE") == "1":
+            if target is not None:
+                raise ValueError(
+                    "Verifier OPD does not support USP-sharded Mooncake storage."
+                )
+            max_seq_raw = os.environ.get("TORCHSPEC_USP_MAX_SEQ_LENGTH")
+            store.put_usp_shards(
+                key=key,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                last_hidden_states=last_hidden_states,
+                target=None,
+                sp_size=int(os.environ["TORCHSPEC_USP_SP_SIZE"]),
+                sp_ring_size=int(os.environ.get("TORCHSPEC_USP_RING_SIZE", "1")),
+                ttt_length=int(os.environ.get("TORCHSPEC_USP_TTT_LENGTH", "1")),
+                max_seq_length=int(max_seq_raw) if max_seq_raw else None,
+            )
+        else:
+            store.put(
+                key=key,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                last_hidden_states=last_hidden_states,
+                target=target,
+            )
+
+    def send_hidden_states_to_mooncake(
+        self,
+        *,
+        req: Req,
+        batch: ScheduleBatch,
+        hidden_states: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
+        hidden_state_offset: int,
+    ) -> None:
+        data_id = batch.spec_training_info.data_ids.get(req.rid, req.rid)
+        key = f"{data_id}_{uuid.uuid4().hex[:8]}"
+        seq_len = hidden_states.shape[0]
+        input_ids = torch.tensor(
+            req.origin_input_ids,
+            dtype=torch.long,
+            device=hidden_states.device,
+        )
+
+        last_hidden_states = None
+        store_lhs = get_spec().spec_training_store_last_hidden_states
+        if store_lhs and logits_output.last_hidden_states is not None:
+            last_hidden_states = logits_output.last_hidden_states[
+                hidden_state_offset : hidden_state_offset + seq_len
+            ]
+
+        self.put_spec_training_mooncake(
+            key=key,
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            last_hidden_states=last_hidden_states,
+            target=None,
+        )
+
+        req.spec_training_mooncake_store_keys.append(key)
+        batch.spec_training_info.mooncake_store_keys[data_id].append(key)
+
+    def send_verifier_opd_to_mooncake(
+        self,
+        *,
+        req: Req,
+        batch: ScheduleBatch,
+    ) -> None:
+        if req.verifier_opd_stored or req.verifier_opd_target is None:
+            return
+        if batch.spec_training_info is None:
+            raise RuntimeError("Verifier OPD request lost spec-training metadata.")
+
+        store = self.get_eagle_mooncake_store()
+        if store is None:
+            raise RuntimeError("Verifier OPD requires the Mooncake training store.")
+        if req.verifier_opd_context_hidden_states is None:
+            raise RuntimeError("Verifier OPD request has no captured context features.")
+        if req.verifier_opd_hidden_states is None:
+            raise RuntimeError("Verifier OPD request has no anchor-aligned features.")
+        if req.verifier_opd_anchor_token_id is None:
+            raise RuntimeError("Verifier OPD request has no captured anchor token.")
+
+        hidden_states = req.verifier_opd_hidden_states
+        device = hidden_states.device
+        prompt_ids = torch.tensor(
+            req.origin_input_ids,
+            dtype=torch.long,
+            device=device,
+        )
+        anchor_id = req.verifier_opd_anchor_token_id.to(
+            device=device,
+            dtype=torch.long,
+        )
+        input_ids = torch.cat((prompt_ids, anchor_id.view(1)))
+        data_id = batch.spec_training_info.data_ids.get(req.rid, req.rid)
+        key = f"{data_id}_{uuid.uuid4().hex[:8]}"
+        self.put_spec_training_mooncake(
+            key=key,
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            last_hidden_states=None,
+            target=req.verifier_opd_target,
+        )
+
+        req.spec_training_mooncake_store_keys.append(key)
+        batch.spec_training_info.mooncake_store_keys[data_id].append(key)
+        req.verifier_opd_context_hidden_states = None
+        req.verifier_opd_anchor_token_id = None
+        req.verifier_opd_hidden_states = None
+        req.verifier_opd_target = None
+        req.verifier_opd_stored = True
 
     @staticmethod
     def _append_decode_hidden_states(
@@ -681,6 +836,8 @@ class SchedulerBatchResultProcessor:
 
     @staticmethod
     def _get_prefill_hidden_capture_mode(batch: ScheduleBatch) -> CaptureHiddenMode:
+        if batch.spec_training_info is not None:
+            return CaptureHiddenMode.FULL
         return get_required_capture_hidden_mode(
             max(
                 batch.return_hidden_states_mode,
@@ -1021,6 +1178,11 @@ class SchedulerBatchResultProcessor:
                 self._handle_sampling_mask_abort(req)
                 continue
 
+            if get_spec().spec_training_verifier_opd:
+                self.send_verifier_opd_to_mooncake(
+                    req=req,
+                    batch=batch,
+                )
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
             if req.return_logprob:

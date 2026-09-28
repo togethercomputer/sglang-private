@@ -960,6 +960,23 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             return _create_error_response(e)
 
 
+@app.api_route("/generate_for_spec_training", methods=["POST", "PUT"])
+async def generate_for_spec_training(obj: GenerateReqInput, request: Request):
+    """Handle a speculative training data collection request.
+
+    This endpoint reuses the generate flow but expects spec_training_data_id
+    and packed_loss_mask to be set.
+    """
+    try:
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
+        return ret
+    except ValueError as e:
+        logger.error(f"[http_server] Error: {e}")
+        return _create_error_response(e)
+
+
 @app.api_route("/encode", methods=["POST", "PUT"])
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""

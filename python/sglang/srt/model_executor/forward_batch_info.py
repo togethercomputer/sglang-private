@@ -834,6 +834,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if skip_attn_backend_init:
             self.mark_forward_metadata_ready()
 
+    # For spec training
+    has_spec_training: bool = False
+
     def init_mlp_sync_metadata(
         self, batch: ScheduleBatch, device: Union[str, torch.device]
     ) -> None:
@@ -891,14 +894,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
-            request_capture_hidden_mode = (
-                CaptureHiddenMode.NULL
-                if model_runner.is_draft_worker
-                else max(
-                    batch.return_hidden_states_mode,
-                    get_server_return_hidden_states_mode(),
+            if batch.spec_training_info is not None:
+                request_capture_hidden_mode = CaptureHiddenMode.FULL
+            else:
+                request_capture_hidden_mode = (
+                    CaptureHiddenMode.NULL
+                    if model_runner.is_draft_worker
+                    else max(
+                        batch.return_hidden_states_mode,
+                        get_server_return_hidden_states_mode(),
+                    )
                 )
-            )
             capture_hidden_mode = get_required_capture_hidden_mode(
                 request_capture_hidden_mode,
                 batch.spec_info,
@@ -992,6 +998,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            # For spec training
+            has_spec_training=batch.spec_training_info is not None,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

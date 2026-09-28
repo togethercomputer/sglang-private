@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 from typing import (
     Literal,
     Optional,
@@ -220,6 +222,31 @@ class Spec(msgspec.Struct):
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
+
+    # Spec training (for speculative decoding model training)
+    enable_spec_training_mooncake: A[
+        bool,
+        "Enable EagleMooncakeStore for spec training hidden state transfer.",
+    ] = False
+    enable_aux_hidden_states: A[
+        bool,
+        "Enable capturing auxiliary hidden states for supported models.",
+    ] = False
+    aux_hidden_state_layer_ids: A[
+        Optional[list[int]],
+        "Layer IDs to capture as auxiliary hidden states. If omitted, model defaults are used.",
+    ] = None
+    spec_training_store_last_hidden_states: A[
+        bool,
+        Arg(
+            help="Whether to store last hidden states for spec training requests.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
+    spec_training_verifier_opd: A[
+        bool,
+        "Capture one DFlash verification block for verifier-OPD training.",
+    ] = False
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."
     ] = None

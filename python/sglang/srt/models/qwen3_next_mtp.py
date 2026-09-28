@@ -95,6 +95,9 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             )
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
+        self.capture_aux_hidden_states = False
+        self.hot_token_id = None
+
     @torch.no_grad()
     def forward(
         self,

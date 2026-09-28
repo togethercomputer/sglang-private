@@ -461,6 +461,8 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        spec_training_data_id: Optional[Union[List[str], str]] = None,
+        packed_loss_mask: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -502,6 +504,8 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            spec_training_data_id=spec_training_data_id,
+            packed_loss_mask=packed_loss_mask,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -576,6 +580,8 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        spec_training_data_id: Optional[Union[List[str], str]] = None,
+        packed_loss_mask: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -617,6 +623,8 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            spec_training_data_id=spec_training_data_id,
+            packed_loss_mask=packed_loss_mask,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

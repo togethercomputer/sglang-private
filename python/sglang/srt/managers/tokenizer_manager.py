@@ -1535,6 +1535,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
+                spec_training_data_id=obj.spec_training_data_id,
+                packed_loss_mask=obj.packed_loss_mask,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -2245,14 +2247,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._dispatch_to_scheduler(obj)
         if expected_workers == 1:
             result = await self.model_update_result
-            if result.success:
+            if result.success and not obj.update_draft_model:
                 self._update_model_path_info(obj.model_path, obj.load_format)
             return result.success, result.message, result.num_paused_requests
         else:
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
-            if all_success is True:
+            if all_success is True and not obj.update_draft_model:
                 self._update_model_path_info(obj.model_path, obj.load_format)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
@@ -2479,6 +2481,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["indexer_topk"] = val
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+
+            if (
+                hasattr(recv_obj, "spec_training_data_ids")
+                and recv_obj.spec_training_data_ids is not None
+                and i < len(recv_obj.spec_training_data_ids)
+                and recv_obj.spec_training_data_ids[i] is not None
+            ):
+                meta_info["spec_training_data_id"] = recv_obj.spec_training_data_ids[i]
+                meta_info["packed_loss_mask"] = recv_obj.packed_loss_masks[i]
+                meta_info["spec_training_mooncake_store_keys"] = (
+                    recv_obj.spec_training_mooncake_store_keys[i]
+                )
 
             state.finished = recv_obj.finished_reasons[i] is not None
 

@@ -375,6 +375,10 @@ class GenerateReqInput:
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
 
+    # Speculative training fields
+    spec_training_data_id: Optional[Union[List[str], str]] = None
+    packed_loss_mask: Optional[Union[List[str], str]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -601,6 +605,7 @@ class GenerateReqInput:
         self._normalize_cache_salt(num)
         self._normalize_kv_hints(num)
         self._normalize_bootstrap_params(num)
+        self.normalize_spec_training_params(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -935,6 +940,27 @@ class GenerateReqInput:
             return self.positional_embed_overrides
         return self.positional_embed_overrides[i]
 
+    def normalize_spec_training_params(self, num: int) -> None:
+        """
+        Normalize speculative training parameters for batch processing.
+
+        """
+        if self.spec_training_data_id is None:
+            self.spec_training_data_id = [None] * num
+        elif not isinstance(self.spec_training_data_id, list):
+            self.spec_training_data_id = [self.spec_training_data_id] * num
+        else:
+            self.spec_training_data_id = (
+                self.spec_training_data_id * self.parallel_sample_num
+            )
+
+        if self.packed_loss_mask is None:
+            self.packed_loss_mask = [None] * num
+        elif not isinstance(self.packed_loss_mask, list):
+            self.packed_loss_mask = [self.packed_loss_mask] * num
+        else:
+            self.packed_loss_mask = self.packed_loss_mask * self.parallel_sample_num
+
     def __getitem__(self, i):
         # Cache sub-objects so that repeated obj[i] calls return the same instance.
         # This avoids subtle bugs where different call sites get divergent objects.
@@ -1023,6 +1049,14 @@ class GenerateReqInput:
             return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
             received_time=self.received_time,
+            spec_training_data_id=(
+                self.spec_training_data_id[i]
+                if self.spec_training_data_id is not None
+                else None
+            ),
+            packed_loss_mask=(
+                self.packed_loss_mask[i] if self.packed_loss_mask is not None else None
+            ),
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None
@@ -1151,6 +1185,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+
+    # Speculative training fields. Keep defaulted IPC additions at the tail.
+    spec_training_data_id: Optional[str] = None
+    packed_loss_mask: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1595,6 +1633,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
+    # Speculative training fields
+    spec_training_data_ids: Optional[List[Optional[str]]] = None
+    packed_loss_masks: Optional[List[Optional[str]]] = None
+    spec_training_mooncake_store_keys: Optional[List[List[str]]] = None
+
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
@@ -1688,6 +1731,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
+
+    # Speculative training fields
+    spec_training_data_ids: Optional[List[Optional[str]]] = None
+    packed_loss_masks: Optional[List[Optional[str]]] = None
+    spec_training_mooncake_store_keys: Optional[List[List[str]]] = None
 
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
@@ -1887,6 +1935,8 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     token_step: int = 0
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Whether to update only the speculative draft model
+    update_draft_model: bool = False
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
 

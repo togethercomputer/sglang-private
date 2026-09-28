@@ -202,6 +202,12 @@ def _resolve_dflash_aux_hidden_state(
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
 
+        if (
+            server_args.enable_aux_hidden_states
+            and server_args.aux_hidden_state_layer_ids is not None
+        ):
+            target_layer_ids = list(server_args.aux_hidden_state_layer_ids)
+
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids

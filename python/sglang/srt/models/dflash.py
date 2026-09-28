@@ -818,7 +818,7 @@ class DFlashDraftModel(nn.Module):
             hidden_states=hidden_states,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -830,6 +830,7 @@ class DFlashDraftModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+        loaded_shards = {}
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
@@ -873,6 +874,7 @@ class DFlashDraftModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(resolved_name)
+                loaded_shards.setdefault(resolved_name, set()).add(shard_id)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -932,6 +934,22 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH Domino checkpoint is missing required projector weights: "
                     f"{sorted(missing)}."
                 )
+
+        for name, shards in loaded_shards.items():
+            expected = {"q", "k", "v"} if "qkv_proj" in name else {0, 1}
+            if shards != expected:
+                raise RuntimeError(
+                    f"Incomplete DFlash fused weight {name}: expected shards "
+                    f"{expected}, got {shards}."
+                )
+
+        if unloaded_params := params_dict.keys() - loaded_params:
+            raise RuntimeError(
+                "Some DFlash weights are not initialized from the checkpoint: "
+                f"{sorted(unloaded_params)}"
+            )
+
+        return loaded_params
 
 
 class DFlashLagunaAttention(DFlashAttention):
