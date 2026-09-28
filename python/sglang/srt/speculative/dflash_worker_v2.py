@@ -2149,11 +2149,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         candidates: torch.Tensor,
         next_token_logits: torch.Tensor,
-        dense_proposal: Optional[DFlashDraftProposal],
         sampling_info,
         draft_input,
         prefix_lens: torch.Tensor,
         bs: int,
+        dense_proposal: Optional[DFlashDraftProposal] = None,
     ):
         new_seq_lens = None
         target_predict = None
