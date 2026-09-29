@@ -565,8 +565,11 @@ class Scheduler(
         self.mooncake_init_thread = None
         self.mooncake_init_error = None
         self.eagle_mooncake_store = None
-        if self.server_args.enable_spec_training_mooncake and self.ps.attn_tp_rank == 0:
-            mooncake_device = torch.device(f"cuda:{self.ps.gpu_id}")
+        if (
+            self.server_args.enable_spec_training_mooncake
+            and get_parallel().attn_tp_rank == 0
+        ):
+            mooncake_device = torch.device(f"cuda:{get_device().gpu_id}")
 
             def init_mooncake() -> None:
                 try:
@@ -2558,7 +2561,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
-            attn_tp_rank=self.ps.attn_tp_rank,
+            attn_tp_rank=get_parallel().attn_tp_rank,
             get_eagle_mooncake_store=lambda: self.eagle_mooncake_store,
         )
 
