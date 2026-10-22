@@ -63,6 +63,11 @@ ENV AITER_COMMIT="v0.1.11.post1"
 # Chosen arch and args
 FROM ${GPU_ARCH}
 
+# SEC-3320: pull the fixed ca-certificates (emSign root removal) from the Ubuntu security pocket; fail if still old
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* && \
+    v="$(dpkg-query -W -f='${Version}' ca-certificates)" && \
+    dpkg --compare-versions "$v" ge 20260816 || { echo "ca-certificates ${v:-missing} < 20260816 (SEC-3320)" >&2; exit 1; }
+
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
