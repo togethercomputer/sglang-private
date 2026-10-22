@@ -5,6 +5,11 @@ ARG PYTHON_VERSION=py3.11
 
 FROM quay.io/ascend/cann:$CANN_VERSION-$DEVICE_TYPE-$OS-$PYTHON_VERSION
 
+# SEC-3320: pull the fixed ca-certificates (emSign root removal) from the Ubuntu security pocket; fail if still old
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* && \
+    v="$(dpkg-query -W -f='${Version}' ca-certificates)" && \
+    dpkg --compare-versions "$v" ge 20260816 || { echo "ca-certificates ${v:-missing} < 20260816 (SEC-3320)" >&2; exit 1; }
+
 # Update pip & apt sources
 ARG TARGETARCH
 ARG CANN_VERSION
