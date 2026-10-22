@@ -226,6 +226,7 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      bash dependencies.sh -y && \
      rm -rf /usr/local/go && \
      wget https://go.dev/dl/go1.26.10.linux-amd64.tar.gz && \
+     echo "ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5  go1.26.10.linux-amd64.tar.gz" | sha256sum -c - && \
      tar -C /usr/local -xzf go1.26.10.linux-amd64.tar.gz && \
      rm go1.26.10.linux-amd64.tar.gz && \
      mkdir -p build && \
