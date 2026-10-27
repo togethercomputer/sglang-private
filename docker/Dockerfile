@@ -1,6 +1,11 @@
 ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
+# SEC-3320: pull the fixed ca-certificates (emSign root removal) from the Ubuntu security pocket; fail if still old
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* && \
+    v="$(dpkg-query -W -f='${Version}' ca-certificates)" && \
+    dpkg --compare-versions "$v" ge 20260816 || { echo "ca-certificates ${v:-missing} < 20260816 (SEC-3320)" >&2; exit 1; }
+
 ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
@@ -472,6 +477,11 @@ WORKDIR /sgl-workspace/sglang
 #
 # Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
+
+# SEC-3320: pull the fixed ca-certificates (emSign root removal) from the Ubuntu security pocket; fail if still old
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* && \
+    v="$(dpkg-query -W -f='${Version}' ca-certificates)" && \
+    dpkg --compare-versions "$v" ge 20260816 || { echo "ca-certificates ${v:-missing} < 20260816 (SEC-3320)" >&2; exit 1; }
 
 ARG CUDA_VERSION
 ARG TARGETARCH

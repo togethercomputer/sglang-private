@@ -63,6 +63,11 @@ ENV AITER_COMMIT="v0.1.11.post1"
 # Chosen arch and args
 FROM ${GPU_ARCH}
 
+# SEC-3320: pull the fixed ca-certificates (emSign root removal) from the Ubuntu security pocket; fail if still old
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* && \
+    v="$(dpkg-query -W -f='${Version}' ca-certificates)" && \
+    dpkg --compare-versions "$v" ge 20260816 || { echo "ca-certificates ${v:-missing} < 20260816 (SEC-3320)" >&2; exit 1; }
+
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
@@ -225,9 +230,10 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      git submodule update --init --recursive && \
      bash dependencies.sh -y && \
      rm -rf /usr/local/go && \
-     wget https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
-     tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
-     rm go1.22.2.linux-amd64.tar.gz && \
+     wget https://go.dev/dl/go1.26.10.linux-amd64.tar.gz && \
+     echo "ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5  go1.26.10.linux-amd64.tar.gz" | sha256sum -c - && \
+     tar -C /usr/local -xzf go1.26.10.linux-amd64.tar.gz && \
+     rm go1.26.10.linux-amd64.tar.gz && \
      mkdir -p build && \
      cd build && \
      cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON && \

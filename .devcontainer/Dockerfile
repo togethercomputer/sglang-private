@@ -8,7 +8,7 @@ RUN groupadd -g $HOST_GID devuser && \
     useradd -m -u $HOST_UID -g $HOST_GID -s /bin/zsh devuser
 
 # Give devuser sudo access
-RUN apt-get update && apt-get install -y sudo && \
+RUN apt-get update && apt-get install -y sudo ca-certificates && \
     echo "devuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/devuser && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
